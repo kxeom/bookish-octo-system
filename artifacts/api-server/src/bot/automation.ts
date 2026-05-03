@@ -212,78 +212,69 @@ async function fillEmailOnPage(
     throw new Error('Tombol Continue tidak ditemukan setelah mengisi email');
   }
 
-  await sendStatus('⏳ Menunggu halaman OTP...');
-  logger.info({ userId }, 'Email submitted, waiting for OTP');
+  await sendStatus('⏳ Menunggu redirect ke halaman OTP...');
+  logger.info({ userId }, 'Email submitted, waiting for auth.openai.com/email-verification');
 
-  // After Continue, ChatGPT may briefly navigate through /api/auth/* URLs
-  // before settling on the OTP page — so we wait and poll rather than just waitForSelector
+  // After Continue, ChatGPT redirects to auth.openai.com/email-verification
+  // Wait for that navigation first (up to 20s)
+  try {
+    await page.waitForURL(
+      (url) => url.hostname.includes('auth.openai.com') || url.pathname.includes('email-verification') || url.pathname.includes('otp'),
+      { timeout: 20000 },
+    );
+  } catch {
+    // Not yet on auth.openai.com — check current URL
+    const currentUrl = page.url();
+    logger.warn({ userId, currentUrl }, 'Did not navigate to auth.openai.com in time');
+    // Still try to find OTP input below — maybe it appeared inline
+  }
+
+  const afterUrl = page.url();
+  logger.info({ userId, url: afterUrl }, 'URL after Continue');
+  await sendStatus(`✅ Redirect ke: ${shortUrl(afterUrl)}`);
+
+  // Now look for the OTP input on auth.openai.com/email-verification
+  // The page typically has individual digit boxes or a single code input
   const OTP_SELECTORS = [
-    'input[name="code"]',
     'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
     'input[inputmode="numeric"]',
-    'input[maxlength="1"]',
+    'input[maxlength="1"]',        // 6 individual digit boxes
+    'input[maxlength="6"]',        // Single 6-digit field
     'input[data-testid*="otp"]',
     'input[data-testid*="code"]',
     'input[placeholder*="code" i]',
-    'input[placeholder*="OTP" i]',
-    'input[type="number"][maxlength]',
+    'input[type="text"]',          // Generic fallback on auth page
   ];
 
   let otpFound = false;
-  const deadline = Date.now() + 40000; // 40 second total wait
+  const deadline = Date.now() + 30000; // 30s after redirect
 
-  while (Date.now() < deadline) {
-    const url = page.url();
-    logger.info({ userId, url }, 'Polling for OTP page');
-
-    // If page navigated to auth0/openai accounts, check there too
+  while (Date.now() < deadline && !otpFound) {
     for (const sel of OTP_SELECTORS) {
       const el = await page.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
+        logger.info({ userId, sel }, 'OTP input found');
         otpFound = true;
         break;
       }
     }
-
-    if (otpFound) break;
-
-    // Also check for "check your email" confirmation text
-    const bodyText = await page.$eval('body', (b) => (b as HTMLElement).innerText)
-      .catch(() => '');
-    if (
-      /check your email|we sent|verify your email|enter the code/i.test(bodyText) &&
-      !bodyText.includes('Error')
-    ) {
-      // OTP was sent, input might appear shortly
-      await page.waitForTimeout(2000);
-      // Try one more time
-      for (const sel of OTP_SELECTORS) {
-        const el = await page.$(sel).catch(() => null);
-        if (el && await el.isVisible().catch(() => false)) {
-          otpFound = true;
-          break;
-        }
-      }
-      if (otpFound) break;
-    }
-
-    await page.waitForTimeout(2000);
+    if (!otpFound) await page.waitForTimeout(2000);
   }
 
   if (!otpFound) {
     const url = page.url();
     const errorText = await page.$eval(
-      '[class*="error"], [role="alert"], .alert',
+      '[class*="error"], [role="alert"], .alert, [class*="Error"]',
       (el) => (el as HTMLElement).innerText,
     ).catch(() => '');
-    const detail = errorText ? ` Pesan error: "${errorText.slice(0, 120)}"` : '';
+    const detail = errorText ? ` Error di halaman: "${errorText.slice(0, 120)}"` : '';
     throw new Error(
-      `Halaman OTP tidak muncul setelah 40 detik.\nURL terakhir: ${shortUrl(url)}${detail}\n\nKemungkinan: email tidak valid, terkena rate limit, atau ChatGPT memblokir akses.`,
+      `Halaman OTP tidak muncul. URL: ${shortUrl(url)}${detail}\nKemungkinan: email tidak valid, kena rate limit, atau akses diblokir.`,
     );
   }
 
-  const otpUrl = page.url();
-  await sendStatus(`✅ Berada di: ${shortUrl(otpUrl)}`);
+  await sendStatus('📨 Kode OTP sudah dikirim ke email kamu!');
 }
 
 // ─── Handle Auth0 / OpenAI account page ──────────────────────────────────────
