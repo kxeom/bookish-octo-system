@@ -25,7 +25,7 @@
   - [Environment Variables](#environment-variables)
   - [Whitelist User](#whitelist-user)
 - [Menjalankan Bot](#-menjalankan-bot)
-- [Deployment](#-deployment)
+- [Deployment ke VPS](#-deployment-ke-vps)
 - [Stack Teknologi](#-stack-teknologi)
 - [FAQ](#-faq)
 
@@ -285,56 +285,111 @@ curl http://localhost:8080/api/healthz
 
 ---
 
-## 📡 Deployment
+## 🖥️ Deployment ke VPS
 
-### Deploy ke Replit
+> Semua perintah di bawah dijalankan di dalam VPS kamu via SSH.
 
-1. Fork/import repo ke [Replit](https://replit.com)
-2. Set environment secrets di **Replit Secrets**:
-   - `TELEGRAM_BOT_TOKEN`
-   - `SESSION_SECRET`
-3. Konfigurasi workflow:
-   ```
-   Command: pnpm --filter @workspace/api-server run dev
-   Port: 8080
-   ```
-4. Klik **Run**
+---
 
-### Deploy ke VPS (Ubuntu/Debian)
+### Langkah 1 — Setup awal VPS (sekali saja)
+
+SSH masuk ke VPS, lalu jalankan setup script otomatis:
 
 ```bash
-# Install Node.js 24
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# Install pnpm
-npm install -g pnpm
-
-# Install Chromium
-sudo apt-get install -y chromium-browser
-
-# Clone dan setup
-git clone https://github.com/username/yushaagpt-bot.git
-cd yushaagpt-bot
-pnpm install
-
-# Set env vars
-export TELEGRAM_BOT_TOKEN="your_token"
-export SESSION_SECRET="your_secret"
-
-# Build dan jalankan
-cd artifacts/api-server
-pnpm run build
-pnpm run start
+# Download dan jalankan setup script
+curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/deploy/setup.sh -o setup.sh
+sudo bash setup.sh
 ```
 
-#### Jalankan sebagai background service (PM2)
+Script ini otomatis menginstall:
+- ✅ Node.js 24
+- ✅ pnpm
+- ✅ PM2 (process manager — biar bot jalan terus)
+- ✅ Chromium + semua dependencies-nya
+- ✅ Git, curl, dan tools lainnya
+
+---
+
+### Langkah 2 — Clone & Deploy
 
 ```bash
-npm install -g pm2
-pm2 start "pnpm run start" --name yushaagpt-bot --cwd artifacts/api-server
-pm2 save
+# Clone repo ke /opt/yushaagpt
+git clone https://github.com/USERNAME/REPO.git /opt/yushaagpt
+cd /opt/yushaagpt
+
+# Jalankan deploy script
+bash deploy/deploy.sh
+```
+
+Script akan otomatis membuat file `.env` dan meminta kamu mengisinya jika belum ada.
+
+#### Isi file .env
+
+```bash
+nano /opt/yushaagpt/.env
+```
+
+```env
+TELEGRAM_BOT_TOKEN=isi_token_dari_botfather
+SESSION_SECRET=isi_string_random_panjang
+NODE_ENV=production
+PORT=8080
+```
+
+> Generate `SESSION_SECRET` yang aman: `openssl rand -base64 32`
+
+Setelah `.env` diisi, jalankan deploy lagi:
+
+```bash
+bash deploy/deploy.sh
+```
+
+---
+
+### Langkah 3 — Update bot (seterusnya)
+
+Setiap kali ada perubahan kode di GitHub, cukup jalankan:
+
+```bash
+cd /opt/yushaagpt
+bash deploy/deploy.sh
+```
+
+Script akan otomatis: `git pull` → `pnpm install` → `build` → `restart PM2`
+
+---
+
+### Perintah PM2 berguna
+
+```bash
+# Lihat status bot
+pm2 list
+
+# Lihat logs real-time
+pm2 logs yushaagpt-bot
+
+# Restart bot
+pm2 restart yushaagpt-bot
+
+# Stop bot
+pm2 stop yushaagpt-bot
+
+# Start bot (setelah stop)
+pm2 start yushaagpt-bot
+
+# Monitor CPU & RAM
+pm2 monit
+```
+
+---
+
+### Auto-start setelah VPS reboot
+
+PM2 sudah dikonfigurasi auto-start oleh deploy script. Tapi kalau perlu setup manual:
+
+```bash
 pm2 startup
+pm2 save
 ```
 
 ---
