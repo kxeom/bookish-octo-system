@@ -138,11 +138,11 @@ bot.on('text', async (ctx) => {
     } catch (err) {
       logger.error({ err, userId }, 'Error in startLoginFlow');
       setUserState(userId, { step: 'waiting_email' });
+      const shortErr = String((err as Error).message).slice(0, 200);
       await ctx.reply(
-        `❌ *Terjadi kesalahan saat menghubungi ChatGPT.*\n\n` +
-          `Pesan error: ${(err as Error).message}\n\n` +
+        `❌ Terjadi kesalahan saat menghubungi ChatGPT.\n\n` +
+          `Error: ${shortErr}\n\n` +
           `Silahkan coba lagi dengan mengirim email kamu.`,
-        { parse_mode: 'Markdown' },
       );
     }
     return;
@@ -193,11 +193,11 @@ bot.on('text', async (ctx) => {
       logger.error({ err, userId }, 'Error in submitOTP');
       clearUserState(userId);
       await closeSession(userId);
+      const shortErr = String((err as Error).message).slice(0, 200);
       await ctx.reply(
-        `❌ *Terjadi kesalahan saat memproses OTP.*\n\n` +
-          `Pesan error: ${(err as Error).message}\n\n` +
+        `❌ Terjadi kesalahan saat memproses OTP.\n\n` +
+          `Error: ${shortErr}\n\n` +
           `Silahkan mulai ulang dengan /start`,
-        { parse_mode: 'Markdown' },
       );
     }
     return;

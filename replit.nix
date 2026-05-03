@@ -1,5 +1,9 @@
 {pkgs}: {
   deps = [
+    pkgs.xorg.libxshmfence
+    pkgs.libGLU
+    pkgs.libGL
+    pkgs.libgbm
     pkgs.libxkbcommon
     pkgs.glib
     pkgs.alsa-lib

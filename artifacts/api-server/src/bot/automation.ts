@@ -17,13 +17,18 @@ export async function startLoginFlow(userId: number, email: string): Promise<voi
     sessions.delete(userId);
   }
 
+  // Use system-installed Chromium to avoid missing shared library issues
+  const systemChromium = '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium';
+
   const browser = await chromium.launch({
     headless: true,
+    executablePath: systemChromium,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--disable-software-rasterizer',
     ],
   });
 
