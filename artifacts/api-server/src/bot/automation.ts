@@ -16,36 +16,160 @@ const sessions = new Map<number, BrowserSession>();
 const SYSTEM_CHROMIUM =
   '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium';
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-async function clickFirst(page: Page, selectors: string[], timeout = 10000): Promise<boolean> {
-  for (const sel of selectors) {
-    try {
-      await page.waitForSelector(sel, { timeout, state: 'visible' });
-      await page.click(sel);
-      return true;
-    } catch { /* try next */ }
+// ─── Stealth init script (injected before every page load) ───────────────────
+// Hides all Playwright/CDP automation indicators from the page's JavaScript
+const STEALTH_SCRIPT = `
+(function () {
+  // 1. Hide webdriver flag
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+
+  // 2. Fake plugins (real browsers have plugins)
+  const fakePlugins = [
+    { name: 'Chrome PDF Plugin',     filename: 'internal-pdf-viewer',    description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer',     filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client',         filename: 'internal-nacl-plugin',   description: '' },
+  ];
+  Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+      const arr = fakePlugins.map((p) => {
+        const plugin = Object.create(Plugin.prototype);
+        Object.defineProperty(plugin, 'name',        { get: () => p.name });
+        Object.defineProperty(plugin, 'filename',    { get: () => p.filename });
+        Object.defineProperty(plugin, 'description', { get: () => p.description });
+        Object.defineProperty(plugin, 'length',      { get: () => 0 });
+        return plugin;
+      });
+      arr.item   = (i) => arr[i];
+      arr.namedItem = (n) => arr.find((p) => p.name === n) ?? null;
+      arr.refresh   = () => {};
+      Object.defineProperty(arr, 'length', { get: () => fakePlugins.length });
+      return arr;
+    },
+    configurable: true,
+  });
+
+  // 3. Languages
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+
+  // 4. Add window.chrome (missing in headless)
+  if (!window.chrome) {
+    window.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}), app: {} };
   }
-  return false;
+
+  // 5. Permissions API — real browsers don't expose automation state
+  const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+  window.navigator.permissions.query = (params) => {
+    if (params && params.name === 'notifications') {
+      return Promise.resolve(Object.assign(Object.create(PermissionStatus.prototype), {
+        state: 'default', onchange: null,
+      }));
+    }
+    return origQuery(params);
+  };
+
+  // 6. Randomise canvas fingerprint slightly (avoids canvas-based bot detection)
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function (...args) {
+    const ctx = this.getContext('2d');
+    if (ctx) {
+      const shift = { r: Math.floor(Math.random() * 3) - 1, g: Math.floor(Math.random() * 3) - 1, b: Math.floor(Math.random() * 3) - 1 };
+      const imgData = ctx.getImageData(0, 0, this.width || 1, this.height || 1);
+      for (let i = 0; i < imgData.data.length; i += 4) {
+        imgData.data[i]     = Math.min(255, Math.max(0, imgData.data[i]     + shift.r));
+        imgData.data[i + 1] = Math.min(255, Math.max(0, imgData.data[i + 1] + shift.g));
+        imgData.data[i + 2] = Math.min(255, Math.max(0, imgData.data[i + 2] + shift.b));
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+    return origToDataURL.apply(this, args);
+  };
+
+  // 7. Hardware concurrency — realistic value
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+
+  // 8. Hide Playwright-specific properties
+  const deleteProps = ['__playwright', '__pwInitScripts', '__pw_manual', 'playwright'];
+  deleteProps.forEach((p) => { try { delete (window as any)[p]; } catch {} });
+})();
+`;
+
+// ─── Utility helpers ──────────────────────────────────────────────────────────
+function rand(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-async function fillFirst(page: Page, selectors: string[], value: string): Promise<boolean> {
-  for (const sel of selectors) {
-    const el = await page.$(sel).catch(() => null);
-    if (el && await el.isVisible().catch(() => false)) {
-      await el.fill(value);
-      return true;
-    }
-  }
-  return false;
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function shortUrl(url: string): string {
   try {
     const u = new URL(url);
-    return u.hostname + (u.pathname !== '/' ? u.pathname.slice(0, 30) : '');
+    return u.hostname + (u.pathname !== '/' ? u.pathname.slice(0, 40) : '');
   } catch {
-    return url.slice(0, 50);
+    return url.slice(0, 60);
   }
+}
+
+// ─── Human-like mouse click ───────────────────────────────────────────────────
+// Moves mouse to a random spot first, then to the element, then clicks
+async function humanClick(page: Page, selector: string, timeout = 12000): Promise<void> {
+  await page.waitForSelector(selector, { state: 'visible', timeout });
+  const el = await page.$(selector);
+  if (!el) throw new Error(`Element tidak ditemukan: ${selector}`);
+
+  const box = await el.boundingBox();
+  if (!box) throw new Error(`Tidak bisa dapat posisi elemen: ${selector}`);
+
+  // Move to a random corner of screen first
+  await page.mouse.move(rand(0, 300), rand(0, 300), { steps: rand(5, 15) });
+  await sleep(rand(80, 200));
+
+  // Move toward element with slight random offset (not perfectly centered)
+  const targetX = box.x + box.width  * (0.3 + Math.random() * 0.4);
+  const targetY = box.y + box.height * (0.3 + Math.random() * 0.4);
+  await page.mouse.move(targetX, targetY, { steps: rand(10, 25) });
+  await sleep(rand(50, 150));
+
+  // Click
+  await page.mouse.click(targetX, targetY);
+}
+
+// ─── Human-like typing ────────────────────────────────────────────────────────
+// Types character by character with random delays, like a real person
+async function humanType(page: Page, selector: string, text: string): Promise<void> {
+  await page.waitForSelector(selector, { state: 'visible', timeout: 10000 });
+  await humanClick(page, selector, 5000);
+  await sleep(rand(100, 300));
+
+  for (const char of text) {
+    await page.keyboard.type(char);
+    await sleep(rand(60, 180));
+    // Occasional micro-pause like a real typist
+    if (Math.random() < 0.08) await sleep(rand(200, 500));
+  }
+}
+
+// ─── Wait for selector with multiple fallbacks ────────────────────────────────
+async function waitAndClick(
+  page: Page,
+  selectors: string[],
+  timeout = 12000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      try {
+        const el = await page.$(sel);
+        if (el && await el.isVisible().catch(() => false)) {
+          await humanClick(page, sel, 5000);
+          return true;
+        }
+      } catch { /* try next */ }
+    }
+    await sleep(500);
+  }
+  return false;
 }
 
 // ─── 1. Start login flow ──────────────────────────────────────────────────────
@@ -61,6 +185,7 @@ export async function startLoginFlow(
     sessions.delete(userId);
   }
 
+  // ── Launch Chromium with stealth args ─────────────────────────────────────
   const browser = await chromium.launch({
     headless: true,
     executablePath: SYSTEM_CHROMIUM,
@@ -70,15 +195,47 @@ export async function startLoginFlow(
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--disable-software-rasterizer',
+      // Anti-bot detection flags
+      '--disable-blink-features=AutomationControlled',
+      '--disable-infobars',
+      '--disable-extensions',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-default-apps',
+      '--disable-features=TranslateUI',
+      '--disable-ipc-flooding-protection',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-background-timer-throttling',
+      '--metrics-recording-only',
+      '--use-mock-keychain',
+      '--ignore-certificate-errors',
+      '--allow-running-insecure-content',
+      '--window-size=1366,768',
     ],
+    ignoreDefaultArgs: ['--enable-automation'],
   });
 
+  // ── Create context with realistic fingerprint ─────────────────────────────
   const context = await browser.newContext({
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1366, height: 768 },
     locale: 'en-US',
+    timezoneId: 'America/New_York',
+    colorScheme: 'light',
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    javaScriptEnabled: true,
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
   });
+
+  // Inject stealth script before every page load
+  await context.addInitScript(STEALTH_SCRIPT);
 
   const page = await context.newPage();
   sessions.set(userId, { browser, context, page, statusCb: sendStatus });
@@ -87,63 +244,111 @@ export async function startLoginFlow(
   await sendStatus('🌐 Membuka chatgpt.com...');
   logger.info({ userId }, 'Navigating to chatgpt.com');
 
-  await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(2000);
+  await page.goto('https://chatgpt.com', {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000,
+  });
+
+  // Wait a bit — behave like a human who just loaded the page
+  await sleep(rand(2000, 4000));
+
+  // Small random mouse movement to simulate human browsing
+  await page.mouse.move(rand(400, 900), rand(200, 500), { steps: rand(10, 20) });
+  await sleep(rand(500, 1200));
 
   await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
 
-  // ── Step 2: Submit email via NextAuth API directly (bypass UI modal) ─────
-  // Clicking the UI modal's Continue causes CSRF mismatch → /api/auth/error
-  // Instead: fetch CSRF token from NextAuth (same cookie context), then POST
-  await sendStatus('📧 Mengirim email ke NextAuth...');
+  // ── Step 2: Click the Login button ───────────────────────────────────────
+  await sendStatus('🖱️ Mencari tombol Login...');
+  const loginClicked = await waitAndClick(page, [
+    'button[data-testid="login-button"]',
+    'a[data-testid="login-link"]',
+    'button:has-text("Log in")',
+    'a:has-text("Log in")',
+    'button:has-text("Login")',
+    'a:has-text("Login")',
+  ], 15000);
 
-  const signinResult = await page.evaluate(async (emailAddr: string) => {
-    // 1. Get CSRF token (must come from same browser context for cookie match)
-    const csrfRes = await fetch('/api/auth/csrf', { credentials: 'include' });
-    if (!csrfRes.ok) return { error: `CSRF fetch failed: ${csrfRes.status}` };
-    const { csrfToken } = await csrfRes.json() as { csrfToken: string };
-
-    // 2. POST email sign-in with CSRF token
-    const body = new URLSearchParams({
-      email: emailAddr,
-      csrfToken,
-      callbackUrl: 'https://chatgpt.com/',
-      json: 'true',
-    });
-    const signinRes = await fetch('/api/auth/signin/email', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      body: body.toString(),
-      credentials: 'include',
-    });
-    if (!signinRes.ok) return { error: `Signin POST failed: ${signinRes.status}` };
-    const data = await signinRes.json() as { url?: string };
-    return { url: data.url ?? null };
-  }, email);
-
-  logger.info({ userId, signinResult }, 'NextAuth signin result');
-
-  if ('error' in signinResult && signinResult.error) {
-    throw new Error(`Gagal mengirim email login: ${signinResult.error}`);
+  if (!loginClicked) {
+    throw new Error('Tombol Login tidak ditemukan di chatgpt.com');
   }
 
-  // 3. Navigate to the verification URL returned by NextAuth
-  const verifyUrl = signinResult.url;
-  if (verifyUrl) {
-    await sendStatus(`✅ Email terkirim, navigasi ke halaman verifikasi...`);
-    await page.goto(verifyUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-  } else {
-    // NextAuth may redirect the page itself — wait for auth.openai.com
-    await sendStatus('⏳ Menunggu redirect ke halaman OTP...');
+  await sendStatus('✅ Tombol Login ditekan, menunggu modal...');
+  // Wait for modal to appear and JS to settle
+  await sleep(rand(2500, 4000));
+
+  // ── Step 3: Handle flow after login click ─────────────────────────────────
+  const urlAfterLogin = page.url();
+  logger.info({ userId, url: urlAfterLogin }, 'URL after login click');
+
+  // If immediately redirected to auth page (sometimes happens)
+  if (urlAfterLogin.includes('auth.openai.com') || urlAfterLogin.includes('auth0')) {
+    await sendStatus(`🔀 Redirect ke: ${shortUrl(urlAfterLogin)}`);
   }
 
-  // ── Step 3: Wait for auth.openai.com/email-verification ──────────────────
+  // ── Step 4: Fill email in modal ───────────────────────────────────────────
+  await sendStatus(`📧 Mengisi email: ${email}`);
+
+  const emailSelectors = [
+    'input[placeholder="Email address"]',
+    'input[placeholder*="email" i]',
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[autocomplete="username"]',
+  ];
+
+  let emailFilled = false;
+  for (let attempt = 0; attempt < 5 && !emailFilled; attempt++) {
+    for (const sel of emailSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (el && await el.isVisible().catch(() => false)) {
+          await humanType(page, sel, email);
+          emailFilled = true;
+          logger.info({ userId, sel }, 'Email typed human-like');
+          break;
+        }
+      } catch { /* try next */ }
+    }
+    if (!emailFilled) {
+      await sleep(rand(1500, 2500));
+      logger.info({ userId, attempt }, 'Email input not found yet, retrying');
+    }
+  }
+
+  if (!emailFilled) {
+    const title = await page.title().catch(() => '');
+    throw new Error(`Form email tidak ditemukan. Halaman: ${title} (${shortUrl(page.url())})`);
+  }
+
+  // Short pause before clicking — humans don't instantly click after typing
+  await sleep(rand(400, 900));
+
+  // ── Step 5: Click Continue ────────────────────────────────────────────────
+  await sendStatus('🖱️ Menekan tombol Continue...');
+
+  const continueClicked = await waitAndClick(page, [
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+    'button:has-text("Sign in")',
+  ], 12000);
+
+  if (!continueClicked) {
+    throw new Error('Tombol Continue tidak ditemukan setelah mengisi email');
+  }
+
+  await sendStatus('⏳ Menunggu redirect ke halaman OTP...');
+  logger.info({ userId }, 'Continue clicked, waiting for auth.openai.com');
+
+  // ── Step 6: Wait for redirect to auth.openai.com/email-verification ───────
   try {
     await page.waitForURL(
-      (url) => url.hostname.includes('auth.openai.com') || url.pathname.includes('email-verification'),
+      (url) =>
+        url.hostname.includes('auth.openai.com') ||
+        url.pathname.includes('email-verification'),
       { timeout: 20000 },
     );
   } catch {
@@ -151,17 +356,19 @@ export async function startLoginFlow(
   }
 
   const afterUrl = page.url();
-  logger.info({ userId, url: afterUrl }, 'URL after email signin');
+  logger.info({ userId, url: afterUrl }, 'URL after Continue');
 
+  // Hard stop if auth error
   if (afterUrl.includes('/api/auth/error')) {
-    throw new Error(
-      'ChatGPT menolak request login (auth/error). Kemungkinan: rate limit, IP diblokir, atau email tidak terdaftar.',
-    );
+    const errorPageText = await page.$eval('body', (b) => (b as HTMLElement).innerText)
+      .catch(() => '');
+    const hint = errorPageText.slice(0, 200);
+    throw new Error(`Login ditolak ChatGPT (auth/error).\nDetail: ${hint}`);
   }
 
   await sendStatus(`✅ Redirect ke: ${shortUrl(afterUrl)}`);
 
-  // ── Step 4: Find OTP input ────────────────────────────────────────────────
+  // ── Step 7: Find OTP input ────────────────────────────────────────────────
   const OTP_SELECTORS = [
     'input[autocomplete="one-time-code"]',
     'input[name="code"]',
@@ -176,6 +383,7 @@ export async function startLoginFlow(
 
   let otpFound = false;
   const deadline = Date.now() + 30000;
+
   while (Date.now() < deadline && !otpFound) {
     for (const sel of OTP_SELECTORS) {
       const el = await page.$(sel).catch(() => null);
@@ -185,165 +393,19 @@ export async function startLoginFlow(
         break;
       }
     }
-    if (!otpFound) await page.waitForTimeout(2000);
+    if (!otpFound) await sleep(2000);
   }
 
   if (!otpFound) {
     const url = page.url();
-    const errorText = await page.$eval(
-      '[class*="error"], [role="alert"], .alert',
-      (el) => (el as HTMLElement).innerText,
+    const errorText = await page.$eval('[class*="error"], [role="alert"], .alert', (el) =>
+      (el as HTMLElement).innerText,
     ).catch(() => '');
     const detail = errorText ? ` Pesan: "${errorText.slice(0, 120)}"` : '';
-    throw new Error(`Input OTP tidak muncul. URL: ${shortUrl(url)}${detail}`);
+    throw new Error(`Input OTP tidak muncul di halaman. URL: ${shortUrl(url)}${detail}`);
   }
 
   await sendStatus('📨 Kode OTP sudah dikirim ke email kamu!');
-}
-
-// ─── Fill email on current page (Auth0 or inline) ────────────────────────────
-async function fillEmailOnPage(
-  userId: number,
-  page: Page,
-  email: string,
-  sendStatus: StatusCallback,
-): Promise<void> {
-  await sendStatus(`📧 Mengisi email: ${email}`);
-
-  const emailSelectors = [
-    'input[placeholder="Email address"]',   // ChatGPT inline modal (from screenshot)
-    'input[placeholder*="Email" i]',
-    'input[placeholder*="email" i]',
-    'input[name="username"]',               // Auth0 standard
-    'input[name="email"]',
-    'input[type="email"]',
-    'input[autocomplete="email"]',
-    'input[autocomplete="username"]',
-    'input[id="username"]',
-    'input[id="email"]',
-  ];
-
-  let filled = false;
-  for (let attempt = 0; attempt < 4 && !filled; attempt++) {
-    for (const sel of emailSelectors) {
-      try {
-        await page.waitForSelector(sel, { timeout: 6000, state: 'visible' });
-        await page.fill(sel, email);
-        filled = true;
-        logger.info({ userId, sel }, 'Email filled with selector');
-        break;
-      } catch { /* try next */ }
-    }
-    if (!filled) {
-      await page.waitForTimeout(2000);
-      logger.info({ userId, url: page.url() }, `Email fill attempt ${attempt + 1} failed`);
-    }
-  }
-
-  if (!filled) {
-    const url = page.url();
-    const title = await page.title();
-    throw new Error(`Form email tidak ditemukan. Halaman: ${title} (${shortUrl(url)})`);
-  }
-
-  await sendStatus('🖱️ Menekan tombol Continue...');
-  const continueClicked = await clickFirst(page, [
-    'button[type="submit"]',
-    'button:has-text("Continue")',
-    'button:has-text("Next")',
-    'button:has-text("Sign in")',
-  ], 10000);
-
-  if (!continueClicked) {
-    throw new Error('Tombol Continue tidak ditemukan setelah mengisi email');
-  }
-
-  await sendStatus('⏳ Menunggu redirect ke halaman OTP...');
-  logger.info({ userId }, 'Email submitted, waiting for auth.openai.com/email-verification');
-
-  // After Continue, ChatGPT redirects to auth.openai.com/email-verification
-  // Wait for that navigation first (up to 20s)
-  try {
-    await page.waitForURL(
-      (url) => url.hostname.includes('auth.openai.com') || url.pathname.includes('email-verification') || url.pathname.includes('otp'),
-      { timeout: 20000 },
-    );
-  } catch {
-    // Not yet on auth.openai.com — check current URL
-    const currentUrl = page.url();
-    logger.warn({ userId, currentUrl }, 'Did not navigate to auth.openai.com in time');
-    // Still try to find OTP input below — maybe it appeared inline
-  }
-
-  const afterUrl = page.url();
-  logger.info({ userId, url: afterUrl }, 'URL after Continue');
-  await sendStatus(`✅ Redirect ke: ${shortUrl(afterUrl)}`);
-
-  // Now look for the OTP input on auth.openai.com/email-verification
-  // The page typically has individual digit boxes or a single code input
-  const OTP_SELECTORS = [
-    'input[autocomplete="one-time-code"]',
-    'input[name="code"]',
-    'input[inputmode="numeric"]',
-    'input[maxlength="1"]',        // 6 individual digit boxes
-    'input[maxlength="6"]',        // Single 6-digit field
-    'input[data-testid*="otp"]',
-    'input[data-testid*="code"]',
-    'input[placeholder*="code" i]',
-    'input[type="text"]',          // Generic fallback on auth page
-  ];
-
-  let otpFound = false;
-  const deadline = Date.now() + 30000; // 30s after redirect
-
-  while (Date.now() < deadline && !otpFound) {
-    for (const sel of OTP_SELECTORS) {
-      const el = await page.$(sel).catch(() => null);
-      if (el && await el.isVisible().catch(() => false)) {
-        logger.info({ userId, sel }, 'OTP input found');
-        otpFound = true;
-        break;
-      }
-    }
-    if (!otpFound) await page.waitForTimeout(2000);
-  }
-
-  if (!otpFound) {
-    const url = page.url();
-    const errorText = await page.$eval(
-      '[class*="error"], [role="alert"], .alert, [class*="Error"]',
-      (el) => (el as HTMLElement).innerText,
-    ).catch(() => '');
-    const detail = errorText ? ` Error di halaman: "${errorText.slice(0, 120)}"` : '';
-    throw new Error(
-      `Halaman OTP tidak muncul. URL: ${shortUrl(url)}${detail}\nKemungkinan: email tidak valid, kena rate limit, atau akses diblokir.`,
-    );
-  }
-
-  await sendStatus('📨 Kode OTP sudah dikirim ke email kamu!');
-}
-
-// ─── Handle Auth0 / OpenAI account page ──────────────────────────────────────
-async function handleAuthPage(
-  userId: number,
-  page: Page,
-  email: string,
-  sendStatus: StatusCallback,
-): Promise<void> {
-  // May need to click "Continue with email" if SSO options shown
-  const emailOptionClicked = await clickFirst(page, [
-    'button:has-text("Continue with email")',
-    'a:has-text("Continue with email")',
-    'button:has-text("Email")',
-    '[data-provider="email"]',
-  ], 5000);
-
-  if (emailOptionClicked) {
-    await sendStatus('✅ Opsi email dipilih');
-    await page.waitForTimeout(2000);
-  }
-
-  await fillEmailOnPage(userId, page, email, sendStatus);
 }
 
 // ─── 2. Submit OTP ────────────────────────────────────────────────────────────
@@ -360,55 +422,79 @@ export async function submitOTP(
   await sendStatus(`🔐 Memasukkan kode OTP: ${otp}`);
   logger.info({ userId }, 'Submitting OTP');
 
-  // Single field (e.g. input[name="code"])
-  const singleField = await page.$('input[name="code"], input[autocomplete="one-time-code"]');
-  if (singleField && await singleField.isVisible().catch(() => false)) {
-    await singleField.fill(otp);
-    logger.info({ userId }, 'Filled single OTP field');
-  } else {
-    // Individual digit boxes
+  // Single OTP field
+  const singleSelectors = [
+    'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
+    'input[inputmode="numeric"][maxlength="6"]',
+  ];
+  let otpEntered = false;
+
+  for (const sel of singleSelectors) {
+    const el = await page.$(sel).catch(() => null);
+    if (el && await el.isVisible().catch(() => false)) {
+      await humanClick(page, sel, 5000);
+      await sleep(rand(200, 400));
+      for (const ch of otp) {
+        await page.keyboard.type(ch);
+        await sleep(rand(80, 160));
+      }
+      logger.info({ userId, sel }, 'OTP typed in single field');
+      otpEntered = true;
+      break;
+    }
+  }
+
+  if (!otpEntered) {
+    // 6 individual digit boxes
     const digits = await page.$$('input[maxlength="1"]');
     if (digits.length > 0) {
       for (let i = 0; i < digits.length && i < otp.length; i++) {
         await digits[i].click();
-        await digits[i].fill(otp[i]);
-        await page.waitForTimeout(80);
+        await sleep(rand(60, 120));
+        await digits[i].type(otp[i]);
+        await sleep(rand(80, 160));
       }
-      logger.info({ userId, count: digits.length }, 'Filled digit OTP boxes');
-    } else {
-      await page.keyboard.type(otp, { delay: 80 });
-      logger.info({ userId }, 'Typed OTP via keyboard');
+      logger.info({ userId, count: digits.length }, 'OTP typed in digit boxes');
+      otpEntered = true;
     }
   }
 
-  // Submit OTP
-  await clickFirst(page, [
+  if (!otpEntered) {
+    // Fallback: keyboard type
+    await page.keyboard.type(otp, { delay: rand(80, 150) });
+    logger.info({ userId }, 'OTP typed via keyboard fallback');
+  }
+
+  await sleep(rand(400, 800));
+
+  // Submit (may auto-submit on last digit)
+  await waitAndClick(page, [
     'button[type="submit"]',
     'button:has-text("Continue")',
     'button:has-text("Verify")',
     'button:has-text("Confirm")',
-  ], 8000).catch(() => { /* may auto-submit */ });
+  ], 5000).catch(() => { /* may auto-submit */ });
 
   await sendStatus('🔄 OTP dikirim, menunggu redirect...');
 
-  // Wait for chatgpt.com
   try {
-    await page.waitForURL(/chatgpt\.com/, { timeout: 25000 });
+    await page.waitForURL(/chatgpt\.com/, { timeout: 30000 });
   } catch {
-    logger.warn({ userId, url: page.url() }, 'Timeout waiting for chatgpt.com redirect');
+    logger.warn({ userId, url: page.url() }, 'Timeout waiting for chatgpt.com after OTP');
   }
 
-  await page.waitForTimeout(3000);
+  await sleep(rand(2000, 4000));
   await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
 
-  // Handle new account
+  // Handle new account setup (name/birthday)
   await handleNewAccountFlow(userId, page, sendStatus);
 
-  // Make sure we are on chatgpt.com
+  // Go to chatgpt.com if not already there
   if (!page.url().startsWith('https://chatgpt.com')) {
     await sendStatus('🌐 Kembali ke chatgpt.com...');
     await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await page.waitForTimeout(2000);
+    await sleep(2000);
   }
 
   await sendStatus('✅ Login berhasil! Mengambil session token...');
@@ -434,19 +520,19 @@ async function handleNewAccountFlow(
   const nameInput = await page.$('input[name="name"], input[id="name"]');
   if (nameInput && await nameInput.isVisible().catch(() => false)) {
     const randomName = generateRandomName();
-    await nameInput.fill(randomName);
-    await sendStatus(`📝 Akun baru terdeteksi, mengisi nama: ${randomName}`);
-    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
-    await page.waitForTimeout(2000);
+    await humanType(page, 'input[name="name"], input[id="name"]', randomName);
+    await sendStatus(`📝 Akun baru: mengisi nama "${randomName}"`);
+    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
+    await sleep(2000);
   }
 
   const ageInput = await page.$('input[type="number"], input[name="age"]');
   if (ageInput && await ageInput.isVisible().catch(() => false)) {
     const age = generateRandomAge();
-    await ageInput.fill(age);
+    await humanType(page, 'input[type="number"], input[name="age"]', age);
     await sendStatus(`📅 Mengisi umur: ${age}`);
-    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
-    await page.waitForTimeout(2000);
+    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
+    await sleep(2000);
   }
 
   const dateInput = await page.$('input[type="date"], input[name="birthdate"]');
@@ -454,25 +540,25 @@ async function handleNewAccountFlow(
     const { month, day, year } = generateRandomBirthdate();
     await dateInput.fill(`${year}-${month}-${day}`);
     await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
-    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
-    await page.waitForTimeout(2000);
+    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
+    await sleep(2000);
   }
 
   const monthSel = await page.$('select[name="month"]');
-  const daySel = await page.$('select[name="day"]');
-  const yearSel = await page.$('select[name="year"]');
+  const daySel   = await page.$('select[name="day"]');
+  const yearSel  = await page.$('select[name="year"]');
   if (monthSel && daySel && yearSel) {
     const { month, day, year } = generateRandomBirthdate();
     await monthSel.selectOption({ value: month });
     await daySel.selectOption({ value: day });
     await yearSel.selectOption({ value: year });
     await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
-    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
-    await page.waitForTimeout(2000);
+    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
+    await sleep(2000);
   }
 }
 
-// ─── Extract session ──────────────────────────────────────────────────────────
+// ─── Extract session token ────────────────────────────────────────────────────
 async function extractSession(page: Page): Promise<string> {
   await page.goto('https://chatgpt.com/api/auth/session', {
     waitUntil: 'networkidle',
@@ -527,21 +613,19 @@ async function processCheckout(
   checkoutUrl: string,
   sendStatus: StatusCallback,
 ): Promise<string> {
-  await sendStatus(`🔀 Berada di: ${shortUrl(checkoutUrl)}`);
+  await sendStatus(`🔀 Menuju checkout: ${shortUrl(checkoutUrl)}`);
   await page.goto(checkoutUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(4000);
-
+  await sleep(rand(3000, 5000));
   await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
 
   // Select GoPay
   await sendStatus('💳 Memilih metode pembayaran GoPay...');
-  const gopayClicked = await clickFirst(page, [
+  const gopayClicked = await waitAndClick(page, [
     'text=GoPay',
     'label:has-text("GoPay")',
     '[data-value*="gopay"]',
     'button:has-text("GoPay")',
     '[aria-label*="GoPay"]',
-    'div:has-text("GoPay")',
   ], 8000);
 
   if (gopayClicked) {
@@ -550,23 +634,27 @@ async function processCheckout(
     await sendStatus('⚠️ GoPay tidak ditemukan, melanjutkan...');
   }
 
-  await page.waitForTimeout(2000);
+  await sleep(rand(1500, 2500));
 
-  // Fill address
-  const addrFilled = await fillFirst(page, [
+  // Fill address if needed
+  for (const sel of [
     'input[placeholder*="address" i]',
     'input[name="address"]',
-    'input[autocomplete="street-address"]',
     'input[placeholder*="alamat" i]',
-  ], 'Jl. Sudirman No. 123, Jakarta Pusat');
+  ]) {
+    const el = await page.$(sel);
+    if (el && await el.isVisible().catch(() => false)) {
+      await humanType(page, sel, 'Jl. Sudirman No. 123, Jakarta Pusat');
+      await sendStatus('📍 Alamat diisi otomatis');
+      break;
+    }
+  }
 
-  if (addrFilled) await sendStatus('📍 Alamat diisi otomatis');
-
-  await page.waitForTimeout(1000);
+  await sleep(rand(800, 1500));
 
   // Click Subscribe
   await sendStatus('🖱️ Menekan tombol Subscribe...');
-  const subscribeClicked = await clickFirst(page, [
+  const subscribeClicked = await waitAndClick(page, [
     'button:has-text("Subscribe")',
     'button:has-text("Berlangganan")',
     'button[type="submit"]:has-text("Subscribe")',
@@ -577,7 +665,7 @@ async function processCheckout(
     await sendStatus('✅ Tombol Subscribe ditekan, menunggu redirect...');
   }
 
-  await page.waitForTimeout(6000);
+  await sleep(rand(5000, 7000));
 
   const finalUrl = page.url();
   await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
