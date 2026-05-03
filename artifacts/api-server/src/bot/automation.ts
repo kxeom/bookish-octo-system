@@ -201,27 +201,89 @@ async function fillEmailOnPage(
   }
 
   await sendStatus('🖱️ Menekan tombol Continue...');
-  await clickFirst(page, [
+  const continueClicked = await clickFirst(page, [
     'button[type="submit"]',
     'button:has-text("Continue")',
     'button:has-text("Next")',
     'button:has-text("Sign in")',
   ], 10000);
 
+  if (!continueClicked) {
+    throw new Error('Tombol Continue tidak ditemukan setelah mengisi email');
+  }
+
   await sendStatus('⏳ Menunggu halaman OTP...');
   logger.info({ userId }, 'Email submitted, waiting for OTP');
 
-  // Wait for OTP field to appear
-  try {
-    await page.waitForSelector(
-      'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[maxlength="1"]',
-      { timeout: 30000 },
-    );
-    const otpUrl = page.url();
-    await sendStatus(`✅ Berada di: ${shortUrl(otpUrl)}\n📨 Kode OTP sudah dikirim ke email kamu!`);
-  } catch {
-    await sendStatus(`⚠️ Halaman OTP tidak terdeteksi otomatis. URL: ${shortUrl(page.url())}`);
+  // After Continue, ChatGPT may briefly navigate through /api/auth/* URLs
+  // before settling on the OTP page — so we wait and poll rather than just waitForSelector
+  const OTP_SELECTORS = [
+    'input[name="code"]',
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'input[maxlength="1"]',
+    'input[data-testid*="otp"]',
+    'input[data-testid*="code"]',
+    'input[placeholder*="code" i]',
+    'input[placeholder*="OTP" i]',
+    'input[type="number"][maxlength]',
+  ];
+
+  let otpFound = false;
+  const deadline = Date.now() + 40000; // 40 second total wait
+
+  while (Date.now() < deadline) {
+    const url = page.url();
+    logger.info({ userId, url }, 'Polling for OTP page');
+
+    // If page navigated to auth0/openai accounts, check there too
+    for (const sel of OTP_SELECTORS) {
+      const el = await page.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        otpFound = true;
+        break;
+      }
+    }
+
+    if (otpFound) break;
+
+    // Also check for "check your email" confirmation text
+    const bodyText = await page.$eval('body', (b) => (b as HTMLElement).innerText)
+      .catch(() => '');
+    if (
+      /check your email|we sent|verify your email|enter the code/i.test(bodyText) &&
+      !bodyText.includes('Error')
+    ) {
+      // OTP was sent, input might appear shortly
+      await page.waitForTimeout(2000);
+      // Try one more time
+      for (const sel of OTP_SELECTORS) {
+        const el = await page.$(sel).catch(() => null);
+        if (el && await el.isVisible().catch(() => false)) {
+          otpFound = true;
+          break;
+        }
+      }
+      if (otpFound) break;
+    }
+
+    await page.waitForTimeout(2000);
   }
+
+  if (!otpFound) {
+    const url = page.url();
+    const errorText = await page.$eval(
+      '[class*="error"], [role="alert"], .alert',
+      (el) => (el as HTMLElement).innerText,
+    ).catch(() => '');
+    const detail = errorText ? ` Pesan error: "${errorText.slice(0, 120)}"` : '';
+    throw new Error(
+      `Halaman OTP tidak muncul setelah 40 detik.\nURL terakhir: ${shortUrl(url)}${detail}\n\nKemungkinan: email tidak valid, terkena rate limit, atau ChatGPT memblokir akses.`,
+    );
+  }
+
+  const otpUrl = page.url();
+  await sendStatus(`✅ Berada di: ${shortUrl(otpUrl)}`);
 }
 
 // ─── Handle Auth0 / OpenAI account page ──────────────────────────────────────
