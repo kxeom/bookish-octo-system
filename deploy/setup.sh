@@ -2,7 +2,7 @@
 # =============================================================================
 # YushaGPT Bot — Setup Script untuk VPS (Ubuntu / Debian)
 # Jalankan sekali saat pertama kali setup VPS
-# Usage: bash setup.sh
+# Usage: sudo bash setup.sh
 # =============================================================================
 
 set -e
@@ -57,7 +57,7 @@ log "Chromium terinstall di: $CHROMIUM_PATH"
 # ─── 4. Install Node.js 24 ────────────────────────────────────────────────────
 header "4/7 Install Node.js 24"
 if ! command -v node &>/dev/null || [[ $(node -v | cut -d. -f1 | tr -d 'v') -lt 24 ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_24.x | bash - -qq
+  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y -qq nodejs
   log "Node.js $(node -v) terinstall"
 else
@@ -66,12 +66,31 @@ fi
 
 # ─── 5. Install pnpm ──────────────────────────────────────────────────────────
 header "5/7 Install pnpm"
-npm install -g pnpm@latest --silent
+npm install -g pnpm@latest
+
+# Pastikan PATH include /usr/local/bin di semua shell baru
+if ! grep -q '/usr/local/bin' /etc/environment 2>/dev/null; then
+  echo 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' > /etc/environment
+fi
+
+# Juga symlink ke /usr/bin kalau belum ada (fallback paling andal)
+PNPM_GLOBAL=$(npm root -g 2>/dev/null | sed 's|/node_modules||')/../bin/pnpm || true
+if [ -f "/usr/local/bin/pnpm" ] && [ ! -f "/usr/bin/pnpm" ]; then
+  ln -sf /usr/local/bin/pnpm /usr/bin/pnpm
+fi
+
+export PATH="$PATH:/usr/local/bin"
 log "pnpm $(pnpm -v) terinstall"
 
 # ─── 6. Install PM2 ──────────────────────────────────────────────────────────
 header "6/7 Install PM2"
-npm install -g pm2@latest --silent
+npm install -g pm2@latest
+
+# Symlink pm2 ke /usr/bin juga
+if [ -f "/usr/local/bin/pm2" ] && [ ! -f "/usr/bin/pm2" ]; then
+  ln -sf /usr/local/bin/pm2 /usr/bin/pm2
+fi
+
 log "PM2 $(pm2 -v) terinstall"
 
 # ─── 7. Buat folder app ───────────────────────────────────────────────────────
@@ -94,5 +113,7 @@ echo ""
 echo "  3. Jalankan deploy script:"
 echo "     bash deploy/deploy.sh"
 echo ""
-echo -e "  Chromium path: ${YELLOW}$CHROMIUM_PATH${NC}"
+echo -e "  Chromium  : ${YELLOW}$CHROMIUM_PATH${NC}"
+echo -e "  pnpm path : ${YELLOW}$(which pnpm)${NC}"
+echo -e "  pm2  path : ${YELLOW}$(which pm2)${NC}"
 echo ""

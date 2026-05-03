@@ -18,6 +18,30 @@ warn()   { echo -e "${YELLOW}[!]${NC} $1"; }
 error()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 header() { echo -e "\n${BLUE}══════════════════════════════════════${NC}"; echo -e "${BLUE}  $1${NC}"; echo -e "${BLUE}══════════════════════════════════════${NC}\n"; }
 
+# ─── Fix PATH agar pnpm & pm2 selalu ketemu ───────────────────────────────────
+export PATH="$PATH:/usr/local/bin:/usr/bin:/root/.local/share/pnpm:/home/$SUDO_USER/.local/share/pnpm"
+
+# ─── Cari pnpm & pm2 ─────────────────────────────────────────────────────────
+PNPM_BIN=$(command -v pnpm 2>/dev/null || echo "")
+PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
+
+if [ -z "$PNPM_BIN" ]; then
+  warn "pnpm tidak ditemukan di PATH, mencoba install ulang..."
+  npm install -g pnpm@latest
+  PNPM_BIN=$(command -v pnpm 2>/dev/null || echo "")
+  [ -z "$PNPM_BIN" ] && error "pnpm tetap tidak ditemukan. Coba logout & login SSH lagi, lalu jalankan ulang."
+fi
+
+if [ -z "$PM2_BIN" ]; then
+  warn "pm2 tidak ditemukan di PATH, mencoba install ulang..."
+  npm install -g pm2@latest
+  PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
+  [ -z "$PM2_BIN" ] && error "pm2 tetap tidak ditemukan. Coba logout & login SSH lagi."
+fi
+
+log "pnpm ditemukan: $PNPM_BIN"
+log "pm2  ditemukan: $PM2_BIN"
+
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$APP_DIR/.env"
 PM2_APP_NAME="yushaagpt-bot"
@@ -68,13 +92,13 @@ log "Code updated"
 
 # ─── Install dependencies ─────────────────────────────────────────────────────
 header "Install dependencies"
-pnpm install --frozen-lockfile
+"$PNPM_BIN" install --frozen-lockfile
 log "Dependencies terinstall"
 
 # ─── Build ───────────────────────────────────────────────────────────────────
 header "Build project"
 cd "$APP_DIR/artifacts/api-server"
-pnpm run build
+"$PNPM_BIN" run build
 log "Build selesai"
 
 # ─── Start / Restart PM2 ─────────────────────────────────────────────────────
@@ -82,15 +106,17 @@ header "Start / Restart PM2"
 cd "$APP_DIR"
 
 # Load env vars dari .env
-export $(grep -v '^#' "$ENV_FILE" | xargs)
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
 
-if pm2 list | grep -q "$PM2_APP_NAME"; then
-  pm2 restart "$PM2_APP_NAME"
+if "$PM2_BIN" list | grep -q "$PM2_APP_NAME"; then
+  "$PM2_BIN" restart "$PM2_APP_NAME"
   log "Bot di-restart via PM2"
 else
-  pm2 start artifacts/api-server/dist/index.mjs \
+  "$PM2_BIN" start artifacts/api-server/dist/index.mjs \
     --name "$PM2_APP_NAME" \
-    --env production \
     --max-memory-restart 512M \
     --restart-delay 3000 \
     --max-restarts 10
@@ -98,17 +124,17 @@ else
 fi
 
 # Simpan PM2 config biar auto-start kalau VPS reboot
-pm2 save
+"$PM2_BIN" save
 log "PM2 config disimpan"
 
 # Setup PM2 startup (auto-start saat reboot)
 if [ "$EUID" -eq 0 ]; then
-  pm2 startup systemd -u root --hp /root > /dev/null 2>&1 || true
+  "$PM2_BIN" startup systemd -u root --hp /root > /dev/null 2>&1 || true
 fi
 
 # ─── Cek status ───────────────────────────────────────────────────────────────
 header "Status Bot"
-pm2 list
+"$PM2_BIN" list
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
