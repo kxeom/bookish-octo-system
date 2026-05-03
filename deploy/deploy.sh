@@ -18,33 +18,32 @@ warn()   { echo -e "${YELLOW}[!]${NC} $1"; }
 error()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 header() { echo -e "\n${BLUE}══════════════════════════════════════${NC}"; echo -e "${BLUE}  $1${NC}"; echo -e "${BLUE}══════════════════════════════════════${NC}\n"; }
 
-# ─── Fix PATH agar pnpm & pm2 selalu ketemu ───────────────────────────────────
-export PATH="$PATH:/usr/local/bin:/usr/bin:/root/.local/share/pnpm:/home/$SUDO_USER/.local/share/pnpm"
+# ─── Fix PATH: tambahkan npm global bin ke PATH ───────────────────────────────
+NPM_GLOBAL_BIN="$(npm root -g 2>/dev/null | sed 's|/node_modules$||')/bin"
+export PATH="$NPM_GLOBAL_BIN:/usr/local/bin:/usr/bin:$PATH"
 
-# ─── Cari pnpm & pm2 ─────────────────────────────────────────────────────────
+# ─── Cari pnpm & pm2 (setelah PATH diperbaiki) ────────────────────────────────
 PNPM_BIN=$(command -v pnpm 2>/dev/null || echo "")
 PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
 
 if [ -z "$PNPM_BIN" ]; then
-  warn "pnpm tidak ditemukan di PATH, mencoba install ulang..."
+  warn "pnpm tidak ditemukan, install ulang..."
   npm install -g pnpm@latest
-  # Re-assign setelah install
   hash -r 2>/dev/null || true
-  PNPM_BIN=$(command -v pnpm 2>/dev/null || ls /usr/local/bin/pnpm 2>/dev/null || ls /usr/bin/pnpm 2>/dev/null || echo "")
-  [ -z "$PNPM_BIN" ] && error "pnpm tetap tidak ditemukan. Jalankan: ln -sf \$(npm root -g)/../bin/pnpm /usr/bin/pnpm"
+  PNPM_BIN=$(command -v pnpm 2>/dev/null || echo "")
+  [ -z "$PNPM_BIN" ] && error "pnpm tidak ditemukan setelah install. Coba: npm install -g pnpm && hash -r"
 fi
 
 if [ -z "$PM2_BIN" ]; then
-  warn "pm2 tidak ditemukan di PATH, mencoba install ulang..."
+  warn "pm2 tidak ditemukan, install ulang..."
   npm install -g pm2@latest
-  # Re-assign setelah install
   hash -r 2>/dev/null || true
-  PM2_BIN=$(command -v pm2 2>/dev/null || ls /usr/local/bin/pm2 2>/dev/null || ls /usr/bin/pm2 2>/dev/null || echo "")
-  [ -z "$PM2_BIN" ] && error "pm2 tetap tidak ditemukan. Jalankan: ln -sf \$(npm root -g)/../bin/pm2 /usr/bin/pm2"
+  PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
+  [ -z "$PM2_BIN" ] && error "pm2 tidak ditemukan setelah install. Coba: npm install -g pm2 && hash -r"
 fi
 
-log "pnpm ditemukan: $PNPM_BIN"
-log "pm2  ditemukan: $PM2_BIN"
+log "pnpm : $PNPM_BIN ($(${PNPM_BIN} -v))"
+log "pm2  : $PM2_BIN"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$APP_DIR/.env"
