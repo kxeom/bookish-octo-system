@@ -871,63 +871,127 @@ async function processCheckout(
 
   if (gopayClicked) {
     await sendStatus('✅ GoPay dipilih');
-    await sleep(rand(1500, 2500));
+    // Give Stripe iframe time to show name/phone fields after GoPay selection
+    await sleep(rand(2000, 3000));
   } else {
     logger.warn({ userId }, 'GoPay not found on checkout page — returning raw checkout URL');
     await sendStatus('⚠️ GoPay tidak ditemukan di halaman checkout');
-    // Return the original checkoutUrl so user can open it directly
     return checkoutUrl;
   }
 
-  // ── Fill address if required ─────────────────────────────────────────────
-  for (const sel of [
-    'input[placeholder*="address" i]',
-    'input[name="address"]',
-    'input[placeholder*="alamat" i]',
-  ]) {
-    const el = await page.$(sel).catch(() => null);
+  // ── Find the Stripe iframe that contains GoPay fields ────────────────────
+  // After selecting GoPay, Stripe shows name + phone fields inside the iframe
+  let stripeFrame = page.mainFrame();
+  for (const frame of page.frames()) {
+    if (frame.url().includes('stripe.com')) {
+      stripeFrame = frame;
+      break;
+    }
+  }
+
+  // ── Fill name in Stripe iframe ────────────────────────────────────────────
+  const nameFieldSelectors = [
+    'input[placeholder*="Full name" i]',
+    'input[placeholder*="Name" i]',
+    'input[name="billingName"]',
+    'input[name="name"]',
+    'input[autocomplete="name"]',
+    'input[autocomplete="given-name"]',
+  ];
+  for (const sel of nameFieldSelectors) {
+    const el = await stripeFrame.$(sel).catch(() => null);
     if (el && await el.isVisible().catch(() => false)) {
-      await humanType(page, sel, 'Jl. Sudirman No. 123, Jakarta Pusat');
-      await sendStatus('📍 Alamat diisi otomatis');
+      const randomName = generateRandomName();
+      await el.click();
+      await sleep(rand(200, 400));
+      await el.fill('');
+      for (const ch of randomName) {
+        await stripeFrame.type(sel, ch);
+        await sleep(rand(60, 140));
+      }
+      await sendStatus(`📝 Nama billing: ${randomName}`);
+      logger.info({ userId, randomName }, 'Name filled in Stripe iframe');
+      break;
+    }
+  }
+
+  await sleep(rand(300, 600));
+
+  // ── Fill phone in Stripe iframe ───────────────────────────────────────────
+  // GoPay requires Indonesian phone number — use a realistic one
+  const phoneSelectors = [
+    'input[placeholder*="phone" i]',
+    'input[placeholder*="telepon" i]',
+    'input[placeholder*="Phone" i]',
+    'input[name="phone"]',
+    'input[type="tel"]',
+    'input[autocomplete="tel"]',
+  ];
+  const fakePhone = `08${rand(1000000000, 9999999999)}`.slice(0, 12);
+  for (const sel of phoneSelectors) {
+    const el = await stripeFrame.$(sel).catch(() => null);
+    if (el && await el.isVisible().catch(() => false)) {
+      await el.click();
+      await sleep(rand(200, 400));
+      await el.fill('');
+      for (const ch of fakePhone) {
+        await stripeFrame.type(sel, ch);
+        await sleep(rand(60, 130));
+      }
+      await sendStatus(`📱 No. HP: ${fakePhone}`);
+      logger.info({ userId, phone: fakePhone }, 'Phone filled in Stripe iframe');
       break;
     }
   }
 
   await sleep(rand(800, 1500));
 
-  // ── Click Subscribe / Pay ────────────────────────────────────────────────
+  // ── Click Subscribe in main frame ─────────────────────────────────────────
   await sendStatus('🖱️ Menekan tombol Subscribe...');
   const subscribeClicked = await waitAndClick(page, [
     'button:has-text("Subscribe")',
+    'button:has-text("Start free trial")',
     'button:has-text("Berlangganan")',
     'button:has-text("Pay")',
-    'button:has-text("Bayar")',
-    'button[type="submit"]:has-text("Subscribe")',
     'button[type="submit"]',
-  ], 10000);
+  ], 12000);
 
   if (subscribeClicked) {
-    await sendStatus('✅ Tombol Subscribe ditekan, menunggu redirect ke GoPay...');
-    // Wait for redirect to GoPay or external payment page
-    try {
-      await page.waitForURL(
-        (url) => !url.hostname.includes('chatgpt.com'),
-        { timeout: 20000 },
-      );
-    } catch {
-      logger.warn({ userId, url: page.url() }, 'No external redirect after Subscribe');
-    }
+    await sendStatus('✅ Subscribe ditekan, menunggu redirect ke Midtrans...');
+    logger.info({ userId }, 'Subscribe clicked, waiting for Midtrans redirect');
   }
 
-  await sleep(rand(3000, 5000));
+  // ── Wait for redirect to Midtrans / GoPay payment page ────────────────────
+  // The redirect may go through chatgpt.com first, then to Midtrans/GoPay
+  let midtransUrl: string | null = null;
+  const redirectDeadline = Date.now() + 40000; // wait up to 40s
 
-  const finalUrl = page.url();
-  logger.info({ userId, finalUrl }, 'Final URL after subscribe');
+  while (Date.now() < redirectDeadline) {
+    const currentUrl = page.url();
+    logger.info({ userId, url: currentUrl }, 'Polling for Midtrans redirect');
+
+    // Stop as soon as we land on a non-chatgpt.com page (Midtrans, GoPay, etc.)
+    if (!currentUrl.includes('chatgpt.com') && currentUrl.startsWith('http')) {
+      midtransUrl = currentUrl;
+      logger.info({ userId, midtransUrl }, 'Landed on external payment page');
+      break;
+    }
+
+    // Also check if chatgpt.com checkout URL changed (different session URL)
+    if (currentUrl !== checkoutUrl && currentUrl.includes('chatgpt.com/checkout')) {
+      // Still on chatgpt, keep waiting
+    }
+
+    await sleep(2000);
+  }
+
+  const finalUrl = midtransUrl ?? page.url();
+  logger.info({ userId, finalUrl, midtransUrl }, 'Final URL after subscribe');
   await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
 
-  // If still on chatgpt.com (no external redirect), return the checkout URL
-  if (finalUrl.includes('chatgpt.com')) {
-    logger.info({ userId }, 'Still on chatgpt.com — returning original checkoutUrl');
+  if (!midtransUrl) {
+    logger.warn({ userId }, 'No Midtrans redirect — returning checkoutUrl');
+    // Return the checkout URL — user can open it directly
     return checkoutUrl;
   }
 
