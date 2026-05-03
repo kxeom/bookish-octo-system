@@ -823,6 +823,43 @@ async function processCheckout(
     .catch(() => '');
   logger.info({ userId, preview: pageText.slice(0, 300) }, 'processCheckout: page text preview');
 
+  // ── Detect and report checkout price to user ─────────────────────────────
+  // Parse "Due today" line — format: "Due today\nIDR 0.00" or "Due today\nIDR 349,000.00"
+  const dueTodayMatch = pageText.match(/Due today[\s\S]*?(IDR[\s\u00a0][\d,]+\.?\d*)/i)
+    ?? pageText.match(/Jatuh tempo hari ini[\s\S]*?(IDR[\s\u00a0][\d,]+\.?\d*)/i);
+  const dueTodayRaw = dueTodayMatch?.[1]?.replace(/\u00a0/g, ' ').trim() ?? null;
+
+  // Also check for offer banner
+  const hasOffer = /offer applied|free trial|promo/i.test(pageText);
+
+  if (dueTodayRaw) {
+    const isZero = /IDR\s*0\.?0*$/.test(dueTodayRaw.replace(/,/g, ''));
+    logger.info({ userId, dueTodayRaw, isZero, hasOffer }, 'Checkout price detected');
+
+    if (isZero) {
+      await sendStatus(
+        `Konfirmasi Harga Checkout:\n\n` +
+        `Harga hari ini: ${dueTodayRaw}\n` +
+        `${hasOffer ? 'Offer/Promo: Aktif (Free Trial)' : ''}\n\n` +
+        `Harga 0 — Aman, lanjut proses!`,
+      );
+    } else {
+      await sendStatus(
+        `PERINGATAN Harga Checkout:\n\n` +
+        `Harga hari ini: ${dueTodayRaw}\n` +
+        `${hasOffer ? 'Offer/Promo: Aktif' : 'Offer/Promo: TIDAK ADA'}\n\n` +
+        `Harga bukan 0! Kemungkinan offer/free trial tidak aktif. Proses dihentikan untuk keamanan.\n\n` +
+        `Ketik /start untuk coba lagi dengan email baru.`,
+      );
+      logger.warn({ userId, dueTodayRaw }, 'Non-zero price detected — aborting checkout');
+      return checkoutUrl;
+    }
+  } else {
+    // Could not parse price — log and continue, don't block
+    logger.warn({ userId }, 'Could not detect "Due today" price from page text');
+    await sendStatus('Harga tidak terdeteksi, melanjutkan proses...');
+  }
+
   // ── Try to select GoPay ──────────────────────────────────────────────────
   await sendStatus('💳 Memilih metode pembayaran GoPay...');
 
