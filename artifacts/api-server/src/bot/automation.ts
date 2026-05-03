@@ -879,38 +879,129 @@ async function processCheckout(
     return checkoutUrl;
   }
 
-  // Wait for Stripe to settle after GoPay selection
+  // Wait for Stripe to render address/name fields after GoPay selection
   await sleep(rand(1500, 2500));
 
-  // ── Fill name field if Stripe shows one (billing name only, no phone) ─────
-  const nameSelectors = [
-    'input[placeholder*="Full name" i]',
-    'input[placeholder*="Name on card" i]',
-    'input[placeholder*="Name" i]',
-    'input[name="billingName"]',
-    'input[name="name"]',
-    'input[autocomplete="name"]',
-    'input[autocomplete="given-name"]',
-  ];
+  // ── Fill ALL billing fields across all Stripe iframes ────────────────────
+  // Stripe uses separate iframes: elements-inner-payment-* (GoPay selector)
+  // and elements-inner-address-* (billing address with name, country, address, etc.)
+  const allSearchFrames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
 
-  const searchFrames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+  const randomName = generateRandomName();
 
-  for (const frame of searchFrames) {
-    let filled = false;
-    for (const sel of nameSelectors) {
+  for (const frame of allSearchFrames) {
+    const furl = frame.url();
+
+    // ── Name ────────────────────────────────────────────────────────────────
+    for (const sel of [
+      'input[name="name"]',
+      'input[autocomplete="name"]',
+      'input[placeholder*="Full name" i]',
+      'input[placeholder*="Name" i]',
+    ]) {
       const el = await frame.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
-        const randomName = generateRandomName();
-        await el.click();
-        await sleep(rand(150, 300));
+        await el.click(); await sleep(rand(100, 200));
         await el.fill(randomName);
-        await sendStatus(`📝 Nama billing: ${randomName}`);
-        logger.info({ userId, sel, randomName, frameUrl: frame.url().slice(0, 60) }, 'Name filled');
-        filled = true;
+        await sendStatus(`📝 Nama: ${randomName}`);
+        logger.info({ userId, sel, randomName, furl: furl.slice(0, 60) }, 'Name filled');
         break;
       }
     }
-    if (filled) break;
+
+    // ── Country (select dropdown) ────────────────────────────────────────────
+    for (const sel of [
+      'select[name="country"]',
+      'select[autocomplete="country"]',
+      'select[autocomplete="country-name"]',
+    ]) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        await el.selectOption({ label: 'Indonesia' }).catch(() => el.selectOption({ value: 'ID' }));
+        await sendStatus('🌏 Negara: Indonesia');
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Country set to Indonesia');
+        await sleep(rand(300, 600));
+        break;
+      }
+    }
+
+    // ── Address line 1 ───────────────────────────────────────────────────────
+    for (const sel of [
+      'input[autocomplete="address-line1"]',
+      'input[name="line1"]',
+      'input[name="address"]',
+      'input[placeholder*="Address" i]',
+      'input[placeholder*="Street" i]',
+    ]) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        await el.click(); await sleep(rand(100, 200));
+        await el.fill('Jl. Sudirman No. 1');
+        await sendStatus('📍 Alamat: Jl. Sudirman No. 1');
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Address line 1 filled');
+        break;
+      }
+    }
+
+    // ── City ─────────────────────────────────────────────────────────────────
+    for (const sel of [
+      'input[autocomplete="address-level2"]',
+      'input[name="city"]',
+      'input[placeholder*="City" i]',
+      'input[placeholder*="Kota" i]',
+    ]) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        await el.click(); await sleep(rand(100, 200));
+        await el.fill('Jakarta Pusat');
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'City filled');
+        break;
+      }
+    }
+
+    // ── State / Province ─────────────────────────────────────────────────────
+    for (const sel of [
+      'input[autocomplete="address-level1"]',
+      'select[autocomplete="address-level1"]',
+      'input[name="state"]',
+      'select[name="state"]',
+      'input[placeholder*="State" i]',
+      'input[placeholder*="Province" i]',
+    ]) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        const tag = await el.evaluate((n) => n.tagName.toLowerCase());
+        if (tag === 'select') {
+          await (el as import('playwright').ElementHandle<HTMLSelectElement>)
+            .selectOption({ label: 'DKI Jakarta' })
+            .catch(() => (el as import('playwright').ElementHandle<HTMLSelectElement>).selectOption({ index: 1 }));
+        } else {
+          await el.click(); await sleep(rand(100, 200));
+          await el.fill('DKI Jakarta');
+        }
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'State filled');
+        break;
+      }
+    }
+
+    // ── Postal code ──────────────────────────────────────────────────────────
+    for (const sel of [
+      'input[autocomplete="postal-code"]',
+      'input[name="postal_code"]',
+      'input[name="zip"]',
+      'input[placeholder*="ZIP" i]',
+      'input[placeholder*="Postal" i]',
+      'input[placeholder*="Kode Pos" i]',
+    ]) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        await el.click(); await sleep(rand(100, 200));
+        await el.fill('10220');
+        await sendStatus('📮 Kode Pos: 10220');
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Postal code filled');
+        break;
+      }
+    }
   }
 
   await sleep(rand(800, 1500));
@@ -930,25 +1021,17 @@ async function processCheckout(
     logger.info({ userId }, 'Subscribe clicked, waiting for Midtrans redirect');
   }
 
-  // ── Wait for redirect to Midtrans / GoPay payment page ────────────────────
-  // The redirect may go through chatgpt.com first, then to Midtrans/GoPay
+  // ── Wait up to 60s for redirect to Midtrans / GoPay payment page ─────────
   let midtransUrl: string | null = null;
-  const redirectDeadline = Date.now() + 40000; // wait up to 40s
+  const redirectDeadline = Date.now() + 60000;
 
   while (Date.now() < redirectDeadline) {
     const currentUrl = page.url();
-    logger.info({ userId, url: currentUrl }, 'Polling for Midtrans redirect');
 
-    // Stop as soon as we land on a non-chatgpt.com page (Midtrans, GoPay, etc.)
     if (!currentUrl.includes('chatgpt.com') && currentUrl.startsWith('http')) {
       midtransUrl = currentUrl;
       logger.info({ userId, midtransUrl }, 'Landed on external payment page');
       break;
-    }
-
-    // Also check if chatgpt.com checkout URL changed (different session URL)
-    if (currentUrl !== checkoutUrl && currentUrl.includes('chatgpt.com/checkout')) {
-      // Still on chatgpt, keep waiting
     }
 
     await sleep(2000);
@@ -956,14 +1039,47 @@ async function processCheckout(
 
   const finalUrl = midtransUrl ?? page.url();
   logger.info({ userId, finalUrl, midtransUrl }, 'Final URL after subscribe');
-  await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
 
+  // ── Fallback diagnostics if no redirect ───────────────────────────────────
   if (!midtransUrl) {
-    logger.warn({ userId }, 'No Midtrans redirect — returning checkoutUrl');
-    // Return the checkout URL — user can open it directly
+    logger.warn({ userId, url: finalUrl }, 'No Midtrans redirect after 60s — dumping page state');
+
+    // Dump visible text on the page to see error messages
+    const pageText = await page.evaluate(() => document.body.innerText).catch(() => '(failed to get text)');
+    logger.warn({ userId, pageText: pageText.slice(0, 1000) }, 'Page text at timeout');
+
+    // Dump any error/alert elements
+    for (const frame of page.frames()) {
+      const errEls = await frame.$$eval(
+        '[role="alert"], .error, [class*="error" i], [class*="alert" i]',
+        (els) => els.map((e) => (e as HTMLElement).innerText?.trim()).filter(Boolean),
+      ).catch(() => [] as string[]);
+      if (errEls.length) {
+        logger.warn({ userId, errors: errEls, frameUrl: frame.url().slice(0, 60) }, 'Error elements on page');
+      }
+    }
+
+    // Dump all frames + their inputs at failure time
+    for (const frame of page.frames()) {
+      const inputs = await frame.$$eval('input, select, button[type="submit"]', (els) =>
+        els.map((el) => ({
+          tag: el.tagName,
+          name: (el as HTMLInputElement).name,
+          value: (el as HTMLInputElement).value?.slice(0, 40),
+          placeholder: (el as HTMLInputElement).placeholder,
+          visible: (el as HTMLElement).offsetParent !== null,
+        })),
+      ).catch(() => [] as object[]);
+      if (inputs.length) {
+        logger.warn({ userId, frameUrl: frame.url().slice(0, 80), inputs }, 'Frame fields at timeout');
+      }
+    }
+
+    await sendStatus('⚠️ Tidak ada redirect ke Midtrans setelah 60 detik. Cek logs untuk detail.');
     return checkoutUrl;
   }
 
+  await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
   return finalUrl;
 }
 
