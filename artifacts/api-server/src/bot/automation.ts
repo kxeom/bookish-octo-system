@@ -10,19 +10,54 @@ interface BrowserSession {
 
 const sessions = new Map<number, BrowserSession>();
 
+// Use system-installed Chromium (avoids missing libgbm / shared lib issues)
+const SYSTEM_CHROMIUM =
+  '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium';
+
+async function getPage(userId: number): Promise<Page> {
+  const s = sessions.get(userId);
+  if (!s) throw new Error('Sesi browser tidak ditemukan. Mulai ulang dengan /start');
+  return s.page;
+}
+
+// ─── Helper: click first matching selector ────────────────────────────────────
+async function clickFirst(page: Page, selectors: string[], timeout = 10000): Promise<boolean> {
+  for (const sel of selectors) {
+    try {
+      await page.waitForSelector(sel, { timeout, state: 'visible' });
+      await page.click(sel);
+      return true;
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
+// ─── Helper: fill first matching selector ─────────────────────────────────────
+async function fillFirst(page: Page, selectors: string[], value: string): Promise<boolean> {
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (el && await el.isVisible().catch(() => false)) {
+      await el.fill(value);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ─── 1. Start login flow ──────────────────────────────────────────────────────
 export async function startLoginFlow(userId: number, email: string): Promise<void> {
+  // Close any existing session
   const existing = sessions.get(userId);
   if (existing) {
     await existing.browser.close().catch(() => {});
     sessions.delete(userId);
   }
 
-  // Use system-installed Chromium to avoid missing shared library issues
-  const systemChromium = '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium';
-
   const browser = await chromium.launch({
     headless: true,
-    executablePath: systemChromium,
+    executablePath: SYSTEM_CHROMIUM,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -34,7 +69,7 @@ export async function startLoginFlow(userId: number, email: string): Promise<voi
 
   const context = await browser.newContext({
     userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 800 },
     locale: 'en-US',
   });
@@ -42,182 +77,253 @@ export async function startLoginFlow(userId: number, email: string): Promise<voi
   const page = await context.newPage();
   sessions.set(userId, { browser, context, page });
 
-  logger.info({ userId, email }, 'Starting ChatGPT login automation');
+  logger.info({ userId, email }, 'Opening chatgpt.com');
 
-  await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // ── Navigate to chatgpt.com login directly ───────────────────────────────
+  await page.goto('https://chatgpt.com/auth/login', {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000,
+  });
+  await page.waitForTimeout(2000);
 
-  // Click login button
-  await page.waitForSelector(
-    'button[data-testid="login-button"], a[href*="login"], button:has-text("Log in"), a:has-text("Log in")',
-    { timeout: 15000 },
-  );
-  await page.click(
-    'button[data-testid="login-button"], a[href*="login"], button:has-text("Log in"), a:has-text("Log in")',
-  );
+  logger.info({ userId, url: page.url() }, 'Landed on page');
 
-  // Wait for email input
-  await page.waitForSelector(
-    'input[name="email"], input[type="email"], input[autocomplete="email"]',
-    { timeout: 20000 },
-  );
-  await page.fill(
-    'input[name="email"], input[type="email"], input[autocomplete="email"]',
-    email,
-  );
+  // ── If still on chatgpt.com, click the Log in button ────────────────────
+  if (page.url().includes('chatgpt.com') && !page.url().includes('auth0') && !page.url().includes('openai.com/')) {
+    const clicked = await clickFirst(page, [
+      'button[data-testid="login-button"]',
+      'a[href*="/auth/login"]',
+      'button:has-text("Log in")',
+      'a:has-text("Log in")',
+      'button:has-text("Login")',
+    ], 10000);
+    logger.info({ userId, clicked }, 'Clicked login button');
+    await page.waitForTimeout(2000);
+  }
 
-  // Submit email
-  await page.click(
-    'button[type="submit"], button:has-text("Continue"), button:has-text("Next")',
-  );
+  // ── Wait until we reach the Auth0 / OpenAI auth page ────────────────────
+  try {
+    await page.waitForURL(/auth0|openai\.com|accounts\.openai|auth\.openai/, {
+      timeout: 15000,
+    });
+  } catch {
+    // maybe already on auth page or chatgpt.com handled it inline
+  }
 
-  logger.info({ userId }, 'Email submitted, waiting for OTP');
+  logger.info({ userId, url: page.url() }, 'On auth page');
+
+  // ── Fill email — Auth0 uses name="username" ──────────────────────────────
+  const emailSelectors = [
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[autocomplete="username"]',
+    'input[id="username"]',
+    'input[id="email"]',
+  ];
+
+  let emailFilled = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const sel of emailSelectors) {
+      try {
+        await page.waitForSelector(sel, { timeout: 8000, state: 'visible' });
+        await page.fill(sel, email);
+        emailFilled = true;
+        logger.info({ userId, sel }, 'Email filled');
+        break;
+      } catch {
+        // next selector
+      }
+    }
+    if (emailFilled) break;
+    await page.waitForTimeout(2000);
+  }
+
+  if (!emailFilled) {
+    const url = page.url();
+    const title = await page.title();
+    throw new Error(`Tidak bisa menemukan form email. URL: ${url}, Title: ${title}`);
+  }
+
+  // ── Submit email ─────────────────────────────────────────────────────────
+  await clickFirst(page, [
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+    'button:has-text("Sign in")',
+  ], 10000);
+
+  logger.info({ userId }, 'Email submitted, waiting for OTP page');
+
+  // ── Wait for OTP step to appear ──────────────────────────────────────────
+  try {
+    await page.waitForSelector(
+      'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[maxlength="1"]',
+      { timeout: 30000 },
+    );
+    logger.info({ userId }, 'OTP input detected');
+  } catch {
+    const url = page.url();
+    logger.warn({ userId, url }, 'OTP input not found, user may check manually');
+  }
 }
 
+// ─── 2. Submit OTP ────────────────────────────────────────────────────────────
 export async function submitOTP(
   userId: number,
   otp: string,
   plan: string,
 ): Promise<string> {
-  const session = sessions.get(userId);
-  if (!session) throw new Error('Sesi browser tidak ditemukan. Mulai ulang dengan /start');
+  const page = await getPage(userId);
 
-  const { page } = session;
+  logger.info({ userId, url: page.url() }, 'Submitting OTP');
 
-  logger.info({ userId }, 'Submitting OTP');
+  // Try single OTP field (e.g. input[name="code"])
+  const singleField = await page.$(
+    'input[name="code"], input[autocomplete="one-time-code"]',
+  );
 
-  // Enter OTP - it might be individual digit boxes or one field
-  try {
-    // Try single OTP field first
-    const singleOtp = await page.$(
-      'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]',
-    );
-    if (singleOtp) {
-      await singleOtp.fill(otp);
-      await page.click('button[type="submit"], button:has-text("Continue"), button:has-text("Verify")').catch(() => {});
-    } else {
-      // Individual digit boxes
-      const digits = await page.$$('input[maxlength="1"]');
+  if (singleField && await singleField.isVisible().catch(() => false)) {
+    await singleField.fill(otp);
+    logger.info({ userId }, 'Filled single OTP field');
+  } else {
+    // Individual digit boxes (maxlength=1)
+    const digits = await page.$$('input[maxlength="1"]');
+    if (digits.length > 0) {
       for (let i = 0; i < digits.length && i < otp.length; i++) {
+        await digits[i].click();
         await digits[i].fill(otp[i]);
+        await page.waitForTimeout(100);
       }
-    }
-  } catch {
-    // Try typing OTP directly
-    await page.keyboard.type(otp);
-    await page.keyboard.press('Enter');
-  }
-
-  // Wait for navigation after OTP
-  await page.waitForTimeout(4000);
-
-  const currentUrl = page.url();
-  logger.info({ userId, url: currentUrl }, 'URL after OTP');
-
-  // Handle new account flow (name/birthday)
-  const needsName = await page
-    .$('input[name="name"], input[placeholder*="name"], input[placeholder*="Name"]')
-    .then((el) => !!el)
-    .catch(() => false);
-
-  const needsAge = await page
-    .$('input[type="number"][max="120"], input[placeholder*="age"], input[name="age"]')
-    .then((el) => !!el)
-    .catch(() => false);
-
-  const needsBirthdate = await page
-    .$('input[name="birthdate"], input[type="date"], [placeholder*="birth"]')
-    .then((el) => !!el)
-    .catch(() => false);
-
-  if (needsName) {
-    logger.info({ userId }, 'New account detected - filling name');
-    const randomName = generateRandomName();
-    await page.fill(
-      'input[name="name"], input[placeholder*="name"], input[placeholder*="Name"]',
-      randomName,
-    );
-    await page.click('button[type="submit"], button:has-text("Continue"), button:has-text("Next")').catch(() => {});
-    await page.waitForTimeout(2000);
-  }
-
-  if (needsAge) {
-    const age = generateRandomAge();
-    await page.fill(
-      'input[type="number"][max="120"], input[placeholder*="age"], input[name="age"]',
-      age,
-    );
-    await page.click('button[type="submit"], button:has-text("Continue"), button:has-text("Next")').catch(() => {});
-    await page.waitForTimeout(2000);
-  }
-
-  if (needsBirthdate) {
-    const { month, day, year } = generateRandomBirthdate();
-    // Try individual fields
-    const monthInput = await page.$('select[name="month"], input[name="month"], input[placeholder*="month"]');
-    const dayInput = await page.$('select[name="day"], input[name="day"], input[placeholder*="day"]');
-    const yearInput = await page.$('select[name="year"], input[name="year"], input[placeholder*="year"]');
-    if (monthInput && dayInput && yearInput) {
-      await monthInput.fill(month);
-      await dayInput.fill(day);
-      await yearInput.fill(year);
+      logger.info({ userId, count: digits.length }, 'Filled digit OTP boxes');
     } else {
-      // Try single date input
-      const dateInput = await page.$('input[name="birthdate"], input[type="date"]');
-      if (dateInput) {
-        await dateInput.fill(`${year}-${month}-${day}`);
-      }
+      // Last resort: focus page and type
+      await page.keyboard.type(otp, { delay: 80 });
+      logger.info({ userId }, 'Typed OTP via keyboard');
     }
-    await page.click('button[type="submit"], button:has-text("Continue"), button:has-text("Next")').catch(() => {});
-    await page.waitForTimeout(3000);
   }
 
-  // Wait until we reach chatgpt.com home
-  await page
-    .waitForURL('https://chatgpt.com/**', { timeout: 20000 })
-    .catch(() => logger.warn({ userId }, 'Timeout waiting for chatgpt.com'));
+  // Submit OTP form
+  await clickFirst(page, [
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Verify")',
+    'button:has-text("Confirm")',
+  ], 8000).catch(() => {
+    // maybe auto-submit after last digit
+  });
 
-  logger.info({ userId }, 'Logged in successfully, extracting session');
+  logger.info({ userId }, 'OTP submitted, waiting for redirect');
 
-  // Get session token
-  const sessionData = await extractSession(page);
+  // ── Wait for redirect back to chatgpt.com ────────────────────────────────
+  try {
+    await page.waitForURL(/chatgpt\.com/, { timeout: 25000 });
+  } catch {
+    logger.warn({ userId, url: page.url() }, 'Still not on chatgpt.com');
+  }
 
-  logger.info({ userId }, 'Session extracted, calling payment API');
+  await page.waitForTimeout(3000);
+  logger.info({ userId, url: page.url() }, 'After OTP redirect');
 
-  // Call payment API
-  const checkoutUrl = await callPaymentAPI(sessionData, plan);
+  // ── Handle new account flow ──────────────────────────────────────────────
+  await handleNewAccountFlow(userId, page);
 
-  logger.info({ userId, checkoutUrl }, 'Checkout URL obtained');
+  // ── Make sure we are on chatgpt.com home ────────────────────────────────
+  if (!page.url().startsWith('https://chatgpt.com')) {
+    await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForTimeout(2000);
+  }
 
-  // Open checkout and process payment
+  logger.info({ userId }, 'Logged in. Extracting session...');
+
+  // ── Get session ──────────────────────────────────────────────────────────
+  const sessionToken = await extractSession(page);
+  logger.info({ userId }, 'Session extracted');
+
+  // ── Call payment API ─────────────────────────────────────────────────────
+  const checkoutUrl = await callPaymentAPI(sessionToken, plan);
+  logger.info({ userId, checkoutUrl }, 'Checkout URL received');
+
+  // ── Process checkout ─────────────────────────────────────────────────────
   const paymentLink = await processCheckout(userId, page, checkoutUrl);
 
   return paymentLink;
 }
 
+// ─── Handle new account (name / birthday / age) ───────────────────────────────
+async function handleNewAccountFlow(userId: number, page: Page): Promise<void> {
+  // Check for name input (new account)
+  const nameInput = await page.$('input[name="name"], input[id="name"]');
+  if (nameInput && await nameInput.isVisible().catch(() => false)) {
+    const randomName = generateRandomName();
+    await nameInput.fill(randomName);
+    logger.info({ userId, randomName }, 'Filled name for new account');
+    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // Check for age input
+  const ageInput = await page.$('input[type="number"], input[name="age"]');
+  if (ageInput && await ageInput.isVisible().catch(() => false)) {
+    const age = generateRandomAge();
+    await ageInput.fill(age);
+    logger.info({ userId, age }, 'Filled age');
+    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // Check for birthdate input
+  const dateInput = await page.$('input[type="date"], input[name="birthdate"]');
+  if (dateInput && await dateInput.isVisible().catch(() => false)) {
+    const { month, day, year } = generateRandomBirthdate();
+    await dateInput.fill(`${year}-${month}-${day}`);
+    logger.info({ userId }, 'Filled birthdate');
+    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // Check for separate month/day/year selects
+  const monthSel = await page.$('select[name="month"]');
+  const daySel = await page.$('select[name="day"]');
+  const yearSel = await page.$('select[name="year"]');
+  if (monthSel && daySel && yearSel) {
+    const { month, day, year } = generateRandomBirthdate();
+    await monthSel.selectOption({ value: month });
+    await daySel.selectOption({ value: day });
+    await yearSel.selectOption({ value: year });
+    logger.info({ userId }, 'Filled birthdate via selects');
+    await clickFirst(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+}
+
+// ─── Extract session ──────────────────────────────────────────────────────────
 async function extractSession(page: Page): Promise<string> {
   await page.goto('https://chatgpt.com/api/auth/session', {
     waitUntil: 'networkidle',
-    timeout: 15000,
+    timeout: 20000,
   });
 
   const bodyText = await page.textContent('body');
-  if (!bodyText) throw new Error('Gagal mengambil session data');
+  if (!bodyText || bodyText.trim() === '') throw new Error('Session body kosong');
 
-  const sessionData = JSON.parse(bodyText);
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    throw new Error('Gagal parse session JSON');
+  }
 
-  // The session token we need
-  const accessToken =
-    sessionData.accessToken ||
-    sessionData.token ||
-    JSON.stringify(sessionData);
+  const token = (parsed['accessToken'] as string) || (parsed['token'] as string);
+  if (!token) throw new Error(`Session token tidak ditemukan. Keys: ${Object.keys(parsed).join(', ')}`);
 
-  if (!accessToken) throw new Error('Session token tidak ditemukan');
-
-  return accessToken;
+  return token;
 }
 
+// ─── Call payment API ─────────────────────────────────────────────────────────
 async function callPaymentAPI(session: string, plan: string): Promise<string> {
-  const response = await fetch('https://ezweystock.petrix.id/gpt/payment', {
+  const resp = await fetch('https://ezweystock.petrix.id/gpt/payment', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -233,106 +339,66 @@ async function callPaymentAPI(session: string, plan: string): Promise<string> {
     }),
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Payment API error: ${response.status} - ${text}`);
-  }
-
-  const data = (await response.json()) as { success: boolean; url?: string; error?: string };
+  const data = (await resp.json()) as { success: boolean; url?: string; error?: string };
   if (!data.success || !data.url) {
-    throw new Error(`Payment API gagal: ${data.error || JSON.stringify(data)}`);
+    throw new Error(`Payment API gagal: ${data.error ?? JSON.stringify(data)}`);
   }
-
   return data.url;
 }
 
-async function processCheckout(
-  userId: number,
-  page: Page,
-  checkoutUrl: string,
-): Promise<string> {
-  logger.info({ userId, checkoutUrl }, 'Opening checkout page');
+// ─── Process checkout ─────────────────────────────────────────────────────────
+async function processCheckout(userId: number, page: Page, checkoutUrl: string): Promise<string> {
+  logger.info({ userId, checkoutUrl }, 'Opening checkout');
 
   await page.goto(checkoutUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(4000);
 
-  // Select GoPay payment method
-  try {
-    const gopaySelectors = [
-      'text=GoPay',
-      '[data-payment-method*="gopay"]',
-      'label:has-text("GoPay")',
-      'button:has-text("GoPay")',
-      '[aria-label*="GoPay"]',
-    ];
-    for (const sel of gopaySelectors) {
-      const el = await page.$(sel).catch(() => null);
-      if (el) {
-        await el.click();
-        logger.info({ userId }, 'GoPay selected');
-        break;
-      }
-    }
-  } catch {
-    logger.warn({ userId }, 'Could not select GoPay, continuing');
-  }
-
+  // Select GoPay
+  const gopayClicked = await clickFirst(page, [
+    'text=GoPay',
+    'label:has-text("GoPay")',
+    '[data-value*="gopay"]',
+    '[data-payment-method*="gopay"]',
+    'button:has-text("GoPay")',
+    '[aria-label*="GoPay"]',
+    'div:has-text("GoPay")',
+  ], 8000);
+  logger.info({ userId, gopayClicked }, 'GoPay click attempted');
   await page.waitForTimeout(2000);
 
-  // Fill address if needed
-  const addressField = await page
-    .$('input[placeholder*="address"], input[name="address"], input[autocomplete="street-address"]')
-    .catch(() => null);
-
-  if (addressField) {
-    const randomAddresses = [
-      'Jl. Sudirman No. 123, Jakarta Pusat',
-      'Jl. Thamrin No. 45, Jakarta',
-      'Jl. Gatot Subroto No. 67, Jakarta Selatan',
-      'Jl. Kuningan No. 89, Jakarta',
-    ];
-    const addr = randomAddresses[Math.floor(Math.random() * randomAddresses.length)];
-    await addressField.fill(addr);
-  }
-
-  // Check total is 0
-  const totalText = await page.textContent(
-    '[data-testid="total"], .total-amount, text=/Rp 0|IDR 0|0\.00/',
-  ).catch(() => '');
-  logger.info({ userId, totalText }, 'Total amount on checkout');
+  // Fill address if visible
+  const addrFilled = await fillFirst(page, [
+    'input[placeholder*="address" i]',
+    'input[name="address"]',
+    'input[autocomplete="street-address"]',
+    'input[placeholder*="alamat" i]',
+  ], 'Jl. Sudirman No. 123, Jakarta Pusat');
+  if (addrFilled) logger.info({ userId }, 'Address filled');
 
   await page.waitForTimeout(1000);
 
-  // Click subscribe button
-  const subscribeSelectors = [
+  // Click Subscribe
+  const subscribeClicked = await clickFirst(page, [
     'button:has-text("Subscribe")',
     'button:has-text("Berlangganan")',
     'button[type="submit"]:has-text("Subscribe")',
     'button[type="submit"]',
-  ];
+  ], 10000);
+  logger.info({ userId, subscribeClicked }, 'Subscribe clicked');
 
-  for (const sel of subscribeSelectors) {
-    const btn = await page.$(sel).catch(() => null);
-    if (btn) {
-      await btn.click();
-      logger.info({ userId }, 'Subscribe button clicked');
-      break;
-    }
-  }
-
-  // Wait for redirect
-  await page.waitForTimeout(5000);
+  // Wait for redirect after subscribe
+  await page.waitForTimeout(6000);
 
   const finalUrl = page.url();
   logger.info({ userId, finalUrl }, 'Final URL after subscribe');
-
   return finalUrl;
 }
 
+// ─── Close session ────────────────────────────────────────────────────────────
 export async function closeSession(userId: number): Promise<void> {
-  const session = sessions.get(userId);
-  if (session) {
-    await session.browser.close().catch(() => {});
+  const s = sessions.get(userId);
+  if (s) {
+    await s.browser.close().catch(() => {});
     sessions.delete(userId);
     logger.info({ userId }, 'Browser session closed');
   }
