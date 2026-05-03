@@ -198,6 +198,11 @@ bot.on('text', async (ctx) => {
     (async () => {
       try {
         const paymentLink = await submitOTP(userId, otp, plan);
+
+        // Close browser immediately after getting payment link — wipe all data
+        // so next session is completely fresh (offer/trial appears again)
+        await closeSession(userId).catch(() => {});
+
         setUserState(userId, { step: 'waiting_confirmation', paymentLink });
 
         await bot.telegram.sendMessage(

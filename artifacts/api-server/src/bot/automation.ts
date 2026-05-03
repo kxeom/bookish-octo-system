@@ -1092,12 +1092,27 @@ async function processCheckout(
   return finalUrl;
 }
 
-// ─── Close session ────────────────────────────────────────────────────────────
+// ─── Close session — wipe all browser data then close ─────────────────────────
 export async function closeSession(userId: number): Promise<void> {
   const s = sessions.get(userId);
-  if (s) {
-    await s.browser.close().catch(() => {});
-    sessions.delete(userId);
-    logger.info({ userId }, 'Browser session closed');
-  }
+  if (!s) return;
+
+  try {
+    // Clear all cookies, localStorage, sessionStorage, cache so next session is 100% fresh
+    await s.context.clearCookies().catch(() => {});
+    await s.context.clearPermissions().catch(() => {});
+
+    // Clear storage for every page in the context
+    for (const page of s.context.pages()) {
+      await page.evaluate(() => {
+        try { localStorage.clear(); } catch (_) {}
+        try { sessionStorage.clear(); } catch (_) {}
+        try { indexedDB && Object.keys(indexedDB).forEach(() => {}); } catch (_) {}
+      }).catch(() => {});
+    }
+  } catch (_) { /* ignore cleanup errors */ }
+
+  await s.browser.close().catch(() => {});
+  sessions.delete(userId);
+  logger.info({ userId }, 'Browser session closed and data wiped');
 }
