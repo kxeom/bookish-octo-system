@@ -879,38 +879,10 @@ async function processCheckout(
     return checkoutUrl;
   }
 
-  // ── Find all Stripe iframes and log their inputs ─────────────────────────
-  await sleep(rand(2000, 3000)); // let Stripe render name/phone after GoPay tap
+  // Wait for Stripe to settle after GoPay selection
+  await sleep(rand(1500, 2500));
 
-  const allFrames = page.frames();
-  logger.info({ userId, frameCount: allFrames.length }, 'All frames after GoPay selection');
-  for (const frame of allFrames) {
-    if (frame === page.mainFrame()) continue;
-    const frameUrl = frame.url();
-    const inputs = await frame.$$eval('input', (els) =>
-      els.map((el) => ({
-        name: (el as HTMLInputElement).name,
-        type: (el as HTMLInputElement).type,
-        placeholder: (el as HTMLInputElement).placeholder,
-        autocomplete: (el as HTMLInputElement).autocomplete,
-        visible: (el as HTMLElement).offsetParent !== null,
-      })),
-    ).catch(() => [] as object[]);
-    logger.info({ userId, frameUrl: frameUrl.slice(0, 80), inputs }, 'Frame inputs');
-  }
-
-  // Helper: fill an input element human-like (works inside any frame)
-  async function fillInput(el: import('playwright').ElementHandle, value: string): Promise<void> {
-    await el.click();
-    await sleep(rand(150, 300));
-    await el.fill('');
-    await sleep(100);
-    for (const ch of value) {
-      await el.pressSequentially(ch, { delay: rand(60, 150) });
-    }
-  }
-
-  // ── Fill name + phone in ANY Stripe iframe that has those fields ──────────
+  // ── Fill name field if Stripe shows one (billing name only, no phone) ─────
   const nameSelectors = [
     'input[placeholder*="Full name" i]',
     'input[placeholder*="Name on card" i]',
@@ -920,55 +892,25 @@ async function processCheckout(
     'input[autocomplete="name"]',
     'input[autocomplete="given-name"]',
   ];
-  const phoneInputSelectors = [
-    'input[placeholder*="GoPay phone" i]',
-    'input[placeholder*="phone number" i]',
-    'input[placeholder*="Phone" i]',
-    'input[placeholder*="Nomor" i]',
-    'input[name="phone"]',
-    'input[type="tel"]',
-    'input[autocomplete="tel"]',
-  ];
-  const fakePhone = `0812${rand(10000000, 99999999)}`;
 
-  // Search every frame (including main) for name/phone inputs
   const searchFrames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
 
-  let nameFilled = false;
-  let phoneFilled = false;
-
   for (const frame of searchFrames) {
-    if (!nameFilled) {
-      for (const sel of nameSelectors) {
-        const el = await frame.$(sel).catch(() => null);
-        if (el && await el.isVisible().catch(() => false)) {
-          const randomName = generateRandomName();
-          await fillInput(el, randomName);
-          await sendStatus(`📝 Nama billing: ${randomName}`);
-          logger.info({ userId, sel, randomName, frameUrl: frame.url().slice(0, 60) }, 'Name filled');
-          nameFilled = true;
-          break;
-        }
+    let filled = false;
+    for (const sel of nameSelectors) {
+      const el = await frame.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        const randomName = generateRandomName();
+        await el.click();
+        await sleep(rand(150, 300));
+        await el.fill(randomName);
+        await sendStatus(`📝 Nama billing: ${randomName}`);
+        logger.info({ userId, sel, randomName, frameUrl: frame.url().slice(0, 60) }, 'Name filled');
+        filled = true;
+        break;
       }
     }
-    if (!phoneFilled) {
-      for (const sel of phoneInputSelectors) {
-        const el = await frame.$(sel).catch(() => null);
-        if (el && await el.isVisible().catch(() => false)) {
-          await fillInput(el, fakePhone);
-          await sendStatus(`📱 No. HP: ${fakePhone}`);
-          logger.info({ userId, sel, fakePhone, frameUrl: frame.url().slice(0, 60) }, 'Phone filled');
-          phoneFilled = true;
-          break;
-        }
-      }
-    }
-    if (nameFilled && phoneFilled) break;
-  }
-
-  if (!phoneFilled) {
-    logger.warn({ userId }, 'Phone field not found in any frame');
-    await sendStatus('⚠️ Field telepon tidak ditemukan, melanjutkan...');
+    if (filled) break;
   }
 
   await sleep(rand(800, 1500));
