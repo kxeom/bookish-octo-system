@@ -538,40 +538,23 @@ export async function submitOTP(
     await sleep(2000);
   }
 
-  // ── Retry loop: get fresh session + checkout URL until price is IDR 0 ──────
-  const MAX_CHECKOUT_ATTEMPTS = 3;
+  await sendStatus('✅ Login berhasil! Mengambil session token...');
+  const sessionToken = await extractSession(page);
+  await sendStatus('✅ Session token berhasil diambil');
 
-  for (let attempt = 1; attempt <= MAX_CHECKOUT_ATTEMPTS; attempt++) {
-    if (attempt > 1) {
-      await sendStatus(`🔄 Retry checkout (${attempt}/${MAX_CHECKOUT_ATTEMPTS})...`);
-      // Go back to chatgpt.com home so session is fresh before re-extracting
-      await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-      await sleep(rand(2000, 3000));
-    }
+  await sendStatus(`💳 Membuat link checkout untuk paket ${plan}...`);
+  const checkoutUrl = await callPaymentAPI(sessionToken, plan);
+  logger.info({ userId, checkoutUrl }, 'Checkout URL from API');
+  await sendStatus('✅ Link checkout berhasil dibuat');
 
-    await sendStatus('✅ Login berhasil! Mengambil session token...');
-    const sessionToken = await extractSession(page);
-    await sendStatus('✅ Session token berhasil diambil');
+  await sendStatus('🛒 Membuka halaman checkout...');
+  const paymentLink = await processCheckout(userId, page, checkoutUrl, sendStatus);
 
-    await sendStatus(`💳 Membuat link checkout untuk paket ${plan}... (percobaan ${attempt}/${MAX_CHECKOUT_ATTEMPTS})`);
-    const checkoutUrl = await callPaymentAPI(sessionToken, plan);
-    logger.info({ userId, attempt, checkoutUrl }, 'Checkout URL from API');
-    await sendStatus('✅ Link checkout berhasil dibuat');
-
-    await sendStatus('🛒 Membuka halaman checkout...');
-    const paymentLink = await processCheckout(userId, page, checkoutUrl, sendStatus);
-
-    if (paymentLink !== null) {
-      return paymentLink;
-    }
-
-    if (attempt < MAX_CHECKOUT_ATTEMPTS) {
-      logger.warn({ userId, attempt }, 'Checkout attempt failed (price not 0 or flow error), retrying...');
-      await sleep(rand(1500, 2500));
-    }
+  if (paymentLink === null) {
+    throw new Error('Harga checkout bukan IDR 0 atau proses gagal. Ketik /start dan coba dengan email baru.');
   }
 
-  throw new Error(`Gagal mendapatkan harga IDR 0 setelah ${MAX_CHECKOUT_ATTEMPTS} percobaan. Coba email baru.`);
+  return paymentLink;
 }
 
 // ─── Handle auth.openai.com/about-you ────────────────────────────────────────

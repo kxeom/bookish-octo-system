@@ -199,8 +199,7 @@ bot.on('text', async (ctx) => {
       try {
         const paymentLink = await submitOTP(userId, otp, plan);
 
-        // Close browser immediately after getting payment link — wipe all data
-        // so next session is completely fresh (offer/trial appears again)
+        // Close browser immediately — wipe all data so next session is fresh
         await closeSession(userId).catch(() => {});
 
         setUserState(userId, { step: 'waiting_confirmation', paymentLink });
@@ -215,6 +214,13 @@ bot.on('text', async (ctx) => {
             ],
           ]),
         );
+
+        // Auto-restart server after session selesai agar IP berganti di sesi berikutnya
+        logger.info({ userId }, 'Session complete — scheduling server restart in 5s');
+        setTimeout(() => {
+          logger.info('Auto-restarting server for fresh session...');
+          process.exit(0);
+        }, 5000);
       } catch (err) {
         logger.error({ err, userId }, 'Error in submitOTP');
         await closeSession(userId).catch(() => {});
