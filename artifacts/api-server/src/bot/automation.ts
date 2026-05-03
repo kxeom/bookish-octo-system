@@ -486,56 +486,55 @@ export async function submitOTP(
   await sendStatus('🔄 OTP dikirim, menunggu redirect...');
   logger.info({ userId }, 'Waiting for redirect after OTP');
 
-  // Wait up to 45s — new accounts may take longer to redirect
+  // New accounts → auth.openai.com/about-you first, then chatgpt.com
+  // Existing accounts → straight to chatgpt.com
   try {
     await page.waitForURL(
-      (url) => url.hostname.includes('chatgpt.com'),
+      (url) =>
+        url.hostname.includes('chatgpt.com') ||
+        (url.hostname.includes('auth.openai.com') && url.pathname !== '/email-verification'),
       { timeout: 45000 },
     );
   } catch {
     const currentUrl = page.url();
-    logger.warn({ userId, url: currentUrl }, 'Timeout waiting for chatgpt.com after OTP');
-    // If still on auth.openai.com, there might be an error or extra step
-    if (currentUrl.includes('auth.openai.com')) {
-      // Check for error message on page
+    logger.warn({ userId, url: currentUrl }, 'Timeout waiting for redirect after OTP');
+    if (currentUrl.includes('auth.openai.com/email-verification')) {
       const pageText = await page.$eval('body', (b) => (b as HTMLElement).innerText).catch(() => '');
-      if (pageText.includes('expired') || pageText.includes('invalid') || pageText.includes('incorrect')) {
+      if (/expired|invalid|incorrect|wrong/i.test(pageText)) {
         throw new Error('Kode OTP salah atau sudah kadaluarsa. Mulai ulang dengan /start');
       }
-      // Try pressing Enter once more
+      // Try Enter once more
       await page.keyboard.press('Enter');
-      await sleep(3000);
-      // One more wait
+      await sleep(4000);
       try {
-        await page.waitForURL((url) => url.hostname.includes('chatgpt.com'), { timeout: 15000 });
+        await page.waitForURL(
+          (url) => url.hostname.includes('chatgpt.com') || (url.hostname.includes('auth.openai.com') && url.pathname !== '/email-verification'),
+          { timeout: 15000 },
+        );
       } catch {
-        throw new Error('Redirect ke chatgpt.com tidak terjadi setelah OTP. Coba /start lagi.');
+        throw new Error('Redirect setelah OTP gagal. Coba /start lagi.');
       }
     }
   }
 
-  await sleep(rand(2000, 3000));
+  await sleep(rand(1500, 2500));
   const landedUrl = page.url();
   logger.info({ userId, url: landedUrl }, 'Landed after OTP');
   await sendStatus(`✅ Berada di: ${shortUrl(landedUrl)}`);
 
-  // ── Handle new account onboarding (/about-you, /onboarding, etc.) ─────────
+  // ── Handle auth.openai.com/about-you (new account setup) ─────────────────
+  if (landedUrl.includes('auth.openai.com/about-you')) {
+    await handleAboutYouPage(userId, page, sendStatus);
+  }
+
+  // ── Handle any remaining onboarding on chatgpt.com ────────────────────────
   await handleNewAccountFlow(userId, page, sendStatus);
 
-  // After onboarding, make sure we end up on chatgpt.com home
-  const finalLanded = page.url();
-  if (!finalLanded.startsWith('https://chatgpt.com') ||
-      finalLanded.includes('/about-you') ||
-      finalLanded.includes('/onboarding')) {
-    await sendStatus('🌐 Menunggu chatgpt.com siap...');
-    try {
-      await page.waitForURL(
-        (url) => url.hostname === 'chatgpt.com' && !url.pathname.includes('/about-you') && !url.pathname.includes('/onboarding'),
-        { timeout: 15000 },
-      );
-    } catch {
-      await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    }
+  // Make sure we're on chatgpt.com home before extracting session
+  const postOnboardingUrl = page.url();
+  if (!postOnboardingUrl.startsWith('https://chatgpt.com')) {
+    await sendStatus('🌐 Menuju chatgpt.com...');
+    await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
     await sleep(2000);
   }
 
@@ -551,6 +550,90 @@ export async function submitOTP(
   const paymentLink = await processCheckout(userId, page, checkoutUrl, sendStatus);
 
   return paymentLink;
+}
+
+// ─── Handle auth.openai.com/about-you ────────────────────────────────────────
+// Page shows: "How old are you?" with Full name + Age inputs + "Finish creating account"
+async function handleAboutYouPage(
+  userId: number,
+  page: Page,
+  sendStatus: StatusCallback,
+): Promise<void> {
+  await sendStatus('📝 Mengisi data akun baru (nama & umur)...');
+  logger.info({ userId }, 'Handling about-you page');
+
+  await sleep(rand(1000, 2000));
+
+  // ── Full name ─────────────────────────────────────────────────────────────
+  const nameSelectors = [
+    'input[placeholder="Full name"]',
+    'input[placeholder*="name" i]',
+    'input[name="name"]',
+    'input[id="name"]',
+    'input[autocomplete="name"]',
+  ];
+  for (const sel of nameSelectors) {
+    const el = await page.$(sel).catch(() => null);
+    if (el && await el.isVisible().catch(() => false)) {
+      const randomName = generateRandomName();
+      await humanType(page, sel, randomName);
+      await sendStatus(`📝 Nama: ${randomName}`);
+      logger.info({ userId, randomName }, 'Full name filled on about-you');
+      break;
+    }
+  }
+
+  await sleep(rand(400, 800));
+
+  // ── Age ───────────────────────────────────────────────────────────────────
+  const ageSelectors = [
+    'input[placeholder="Age"]',
+    'input[placeholder*="age" i]',
+    'input[name="age"]',
+    'input[id="age"]',
+    'input[type="number"]',
+  ];
+  for (const sel of ageSelectors) {
+    const el = await page.$(sel).catch(() => null);
+    if (el && await el.isVisible().catch(() => false)) {
+      const age = generateRandomAge();
+      await humanType(page, sel, age);
+      await sendStatus(`📅 Umur: ${age}`);
+      logger.info({ userId, age }, 'Age filled on about-you');
+      break;
+    }
+  }
+
+  await sleep(rand(500, 1000));
+
+  // ── Finish creating account ───────────────────────────────────────────────
+  const finished = await waitAndClick(page, [
+    'button:has-text("Finish creating account")',
+    'button:has-text("Finish")',
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Done")',
+  ], 10000);
+
+  if (finished) {
+    await sendStatus('✅ Akun berhasil dibuat, menunggu redirect...');
+    logger.info({ userId }, 'Clicked finish on about-you');
+  } else {
+    logger.warn({ userId }, 'Could not find finish button on about-you');
+  }
+
+  // Wait for redirect to chatgpt.com after finishing account creation
+  try {
+    await page.waitForURL(
+      (url) => url.hostname.includes('chatgpt.com'),
+      { timeout: 20000 },
+    );
+    await sendStatus(`✅ Redirect ke: ${shortUrl(page.url())}`);
+  } catch {
+    logger.warn({ userId, url: page.url() }, 'Timeout waiting for chatgpt.com after about-you');
+  }
+
+  await sleep(rand(1500, 2500));
 }
 
 // ─── Handle new account onboarding (loops through all screens) ───────────────
