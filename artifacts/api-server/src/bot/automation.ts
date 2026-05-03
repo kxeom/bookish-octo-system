@@ -1,5 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
-import { generateRandomName, generateRandomBirthdate, generateRandomAge } from './helpers';
+import { generateRandomName, generateRandomBirthdate, generateRandomAge, generateRandomAddress } from './helpers';
 import { logger } from '../lib/logger';
 
 export type StatusCallback = (msg: string) => Promise<void>;
@@ -888,6 +888,7 @@ async function processCheckout(
   const allSearchFrames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
 
   const randomName = generateRandomName();
+  const randomAddr = generateRandomAddress();
 
   for (const frame of allSearchFrames) {
     const furl = frame.url();
@@ -939,9 +940,9 @@ async function processCheckout(
       const el = await frame.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
         await el.click(); await sleep(rand(100, 200));
-        await el.fill('Jl. Sudirman No. 1');
-        await sendStatus('📍 Alamat: Jl. Sudirman No. 1');
-        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Address line 1 filled');
+        await el.fill(randomAddr.line1);
+        await sendStatus(`📍 Alamat: ${randomAddr.line1}`);
+        logger.info({ userId, sel, addr: randomAddr.line1, furl: furl.slice(0, 60) }, 'Address line 1 filled');
         break;
       }
     }
@@ -957,9 +958,9 @@ async function processCheckout(
       const el = await frame.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
         await el.click(); await sleep(rand(100, 200));
-        await el.fill('Jakarta Pusat');
-        await sendStatus('🏙️ Kota: Jakarta Pusat');
-        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'City filled');
+        await el.fill(randomAddr.city);
+        await sendStatus(`🏙️ Kota: ${randomAddr.city}`);
+        logger.info({ userId, sel, city: randomAddr.city, furl: furl.slice(0, 60) }, 'City filled');
         break;
       }
     }
@@ -979,15 +980,14 @@ async function processCheckout(
         if (tag === 'select') {
           // Try common Indonesian province labels
           await (el as import('playwright').ElementHandle<HTMLSelectElement>)
-            .selectOption({ label: 'DKI Jakarta' })
-            .catch(() => (el as import('playwright').ElementHandle<HTMLSelectElement>).selectOption({ label: 'Jakarta' }))
+            .selectOption({ label: randomAddr.province })
             .catch(() => (el as import('playwright').ElementHandle<HTMLSelectElement>).selectOption({ index: 1 }));
         } else {
           await el.click(); await sleep(rand(100, 200));
-          await el.fill('DKI Jakarta');
+          await el.fill(randomAddr.province);
         }
-        await sendStatus('🗺️ Provinsi: DKI Jakarta');
-        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'State/province filled');
+        await sendStatus(`🗺️ Provinsi: ${randomAddr.province}`);
+        logger.info({ userId, sel, province: randomAddr.province, furl: furl.slice(0, 60) }, 'State/province filled');
         break;
       }
     }
@@ -1005,9 +1005,9 @@ async function processCheckout(
       const el = await frame.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
         await el.click(); await sleep(rand(100, 200));
-        await el.fill('10220');
-        await sendStatus('📮 Kode Pos: 10220');
-        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Postal code filled');
+        await el.fill(randomAddr.postalCode);
+        await sendStatus(`📮 Kode Pos: ${randomAddr.postalCode}`);
+        logger.info({ userId, sel, postalCode: randomAddr.postalCode, furl: furl.slice(0, 60) }, 'Postal code filled');
         break;
       }
     }
