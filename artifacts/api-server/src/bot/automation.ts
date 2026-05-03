@@ -92,67 +92,113 @@ export async function startLoginFlow(
 
   await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
 
-  // ── Step 2: Click the Login button ───────────────────────────────────────
-  await sendStatus('🖱️ Mencari dan menekan tombol Login...');
+  // ── Step 2: Submit email via NextAuth API directly (bypass UI modal) ─────
+  // Clicking the UI modal's Continue causes CSRF mismatch → /api/auth/error
+  // Instead: fetch CSRF token from NextAuth (same cookie context), then POST
+  await sendStatus('📧 Mengirim email ke NextAuth...');
 
-  const loginClicked = await clickFirst(page, [
-    'button[data-testid="login-button"]',
-    'a[data-testid="login-link"]',
-    'button:has-text("Log in")',
-    'a:has-text("Log in")',
-    'button:has-text("Login")',
-    'a:has-text("Login")',
-    '[href*="/auth/login"]',
-  ], 15000);
+  const signinResult = await page.evaluate(async (emailAddr: string) => {
+    // 1. Get CSRF token (must come from same browser context for cookie match)
+    const csrfRes = await fetch('/api/auth/csrf', { credentials: 'include' });
+    if (!csrfRes.ok) return { error: `CSRF fetch failed: ${csrfRes.status}` };
+    const { csrfToken } = await csrfRes.json() as { csrfToken: string };
 
-  if (!loginClicked) {
-    throw new Error('Tombol Login tidak ditemukan di halaman chatgpt.com');
+    // 2. POST email sign-in with CSRF token
+    const body = new URLSearchParams({
+      email: emailAddr,
+      csrfToken,
+      callbackUrl: 'https://chatgpt.com/',
+      json: 'true',
+    });
+    const signinRes = await fetch('/api/auth/signin/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+      },
+      body: body.toString(),
+      credentials: 'include',
+    });
+    if (!signinRes.ok) return { error: `Signin POST failed: ${signinRes.status}` };
+    const data = await signinRes.json() as { url?: string };
+    return { url: data.url ?? null };
+  }, email);
+
+  logger.info({ userId, signinResult }, 'NextAuth signin result');
+
+  if ('error' in signinResult && signinResult.error) {
+    throw new Error(`Gagal mengirim email login: ${signinResult.error}`);
   }
 
-  await sendStatus('✅ Tombol Login ditekan, menunggu form muncul...');
-  // Wait for modal to appear
-  await page.waitForTimeout(3000);
-
-  // ── Step 3: Detect form — inline modal or redirect to auth page ──────────
-  const currentUrl = page.url();
-  logger.info({ userId, url: currentUrl }, 'URL after login click');
-
-  // If redirected to auth page (auth0/openai accounts)
-  if (/auth0|openai\.com\/|accounts\.|auth\.openai/.test(currentUrl)) {
-    await sendStatus(`🔀 Redirect ke: ${shortUrl(currentUrl)}`);
-    await handleAuthPage(userId, page, email, sendStatus);
-    return;
+  // 3. Navigate to the verification URL returned by NextAuth
+  const verifyUrl = signinResult.url;
+  if (verifyUrl) {
+    await sendStatus(`✅ Email terkirim, navigasi ke halaman verifikasi...`);
+    await page.goto(verifyUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+  } else {
+    // NextAuth may redirect the page itself — wait for auth.openai.com
+    await sendStatus('⏳ Menunggu redirect ke halaman OTP...');
   }
 
-  // ── Modal inline on chatgpt.com ──────────────────────────────────────────
-  // From UI: modal shows "Log in or sign up" with Google/Apple/Phone buttons
-  // then an "Email address" input field and "Continue" button
-  await sendStatus('📋 Form login muncul...');
-
-  // Wait for the email input in the modal (placeholder: "Email address")
+  // ── Step 3: Wait for auth.openai.com/email-verification ──────────────────
   try {
-    await page.waitForSelector(
-      'input[placeholder="Email address"], input[placeholder*="email" i], input[placeholder*="Email" i]',
-      { timeout: 8000, state: 'visible' },
+    await page.waitForURL(
+      (url) => url.hostname.includes('auth.openai.com') || url.pathname.includes('email-verification'),
+      { timeout: 20000 },
     );
-    await sendStatus('✅ Form email terdeteksi');
   } catch {
-    // Maybe there's a "Continue with email" button first
-    await sendStatus('🔍 Mencari opsi login dengan email...');
-    const emailOptionClicked = await clickFirst(page, [
-      'button:has-text("Continue with email")',
-      'a:has-text("Continue with email")',
-      'button:has-text("Email")',
-      '[data-provider="email"]',
-    ], 6000);
-    if (emailOptionClicked) {
-      await sendStatus('✅ Opsi email dipilih');
-      await page.waitForTimeout(2000);
-    }
+    logger.warn({ userId, url: page.url() }, 'waitForURL auth.openai.com timed out');
   }
 
-  // Fill email in the modal
-  await fillEmailOnPage(userId, page, email, sendStatus);
+  const afterUrl = page.url();
+  logger.info({ userId, url: afterUrl }, 'URL after email signin');
+
+  if (afterUrl.includes('/api/auth/error')) {
+    throw new Error(
+      'ChatGPT menolak request login (auth/error). Kemungkinan: rate limit, IP diblokir, atau email tidak terdaftar.',
+    );
+  }
+
+  await sendStatus(`✅ Redirect ke: ${shortUrl(afterUrl)}`);
+
+  // ── Step 4: Find OTP input ────────────────────────────────────────────────
+  const OTP_SELECTORS = [
+    'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
+    'input[inputmode="numeric"]',
+    'input[maxlength="1"]',
+    'input[maxlength="6"]',
+    'input[data-testid*="otp"]',
+    'input[data-testid*="code"]',
+    'input[placeholder*="code" i]',
+    'input[type="text"]',
+  ];
+
+  let otpFound = false;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline && !otpFound) {
+    for (const sel of OTP_SELECTORS) {
+      const el = await page.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        logger.info({ userId, sel }, 'OTP input found');
+        otpFound = true;
+        break;
+      }
+    }
+    if (!otpFound) await page.waitForTimeout(2000);
+  }
+
+  if (!otpFound) {
+    const url = page.url();
+    const errorText = await page.$eval(
+      '[class*="error"], [role="alert"], .alert',
+      (el) => (el as HTMLElement).innerText,
+    ).catch(() => '');
+    const detail = errorText ? ` Pesan: "${errorText.slice(0, 120)}"` : '';
+    throw new Error(`Input OTP tidak muncul. URL: ${shortUrl(url)}${detail}`);
+  }
+
+  await sendStatus('📨 Kode OTP sudah dikirim ke email kamu!');
 }
 
 // ─── Fill email on current page (Auth0 or inline) ────────────────────────────
