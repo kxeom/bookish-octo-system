@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
 import { getUserState, setUserState, clearUserState } from './state';
 import { isValidEmail } from './helpers';
-import { startLoginFlow, submitOTP, closeSession } from './automation';
+import { startLoginFlow, submitOTP, closeSession, type StatusCallback } from './automation';
 import { logger } from '../lib/logger';
 
 const token = process.env['TELEGRAM_BOT_TOKEN'];
@@ -15,22 +15,33 @@ const PLAN_LABELS: Record<string, string> = {
   business: '💼 ChatGPT Business',
 };
 
-// /start command
+// Build a sendStatus function that sends a message to the user
+function makeSendStatus(ctx: Context): StatusCallback {
+  return async (msg: string) => {
+    try {
+      await ctx.reply(msg);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to send status message');
+    }
+  };
+}
+
+// ─── /start ──────────────────────────────────────────────────────────────────
 bot.start(async (ctx) => {
   clearUserState(ctx.from.id);
   await ctx.reply(
     `👋 *Selamat datang di ChatGPT Upgrade Bot!*\n\n` +
-      `Bot ini akan membantu kamu upgrade akun ChatGPT kamu secara otomatis.\n\n` +
+      `Bot ini akan membantu kamu upgrade akun ChatGPT secara otomatis.\n\n` +
       `📋 *Cara Pemakaian:*\n` +
       `1. Pilih paket yang kamu inginkan\n` +
       `2. Masukkan email kamu\n` +
       `3. Masukkan OTP yang dikirim ke email\n` +
-      `4. Bot akan memproses upgrade secara otomatis\n` +
+      `4. Bot memproses upgrade otomatis (kamu bisa lihat prosesnya real\\-time)\n` +
       `5. Konfirmasi setelah pembayaran selesai\n\n` +
       `⚠️ *Pastikan email kamu aktif dan dapat menerima OTP*\n\n` +
       `Pilih paket upgrade:`,
     {
-      parse_mode: 'Markdown',
+      parse_mode: 'MarkdownV2',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('⭐ Upgrade Plus', 'plan_plus')],
         [Markup.button.callback('💼 Upgrade Business', 'plan_business')],
@@ -39,7 +50,7 @@ bot.start(async (ctx) => {
   );
 });
 
-// Plan selection
+// ─── Plan selection ───────────────────────────────────────────────────────────
 bot.action('plan_plus', async (ctx) => {
   await ctx.answerCbQuery();
   await handlePlanSelect(ctx, 'plus');
@@ -55,13 +66,12 @@ async function handlePlanSelect(ctx: Context, plan: 'plus' | 'business') {
   setUserState(userId, { step: 'waiting_email', plan });
 
   await ctx.reply(
-    `✅ Kamu memilih *${PLAN_LABELS[plan]}*\n\n` +
-      `📧 Silahkan masukkan *email* kamu yang terdaftar atau akan didaftarkan di ChatGPT:`,
-    { parse_mode: 'Markdown' },
+    `✅ Kamu memilih ${PLAN_LABELS[plan]}\n\n` +
+      `📧 Silahkan masukkan email kamu yang terdaftar atau akan didaftarkan di ChatGPT:`,
   );
 }
 
-// Handle sukses/batal confirmation
+// ─── Confirm sukses / batal ───────────────────────────────────────────────────
 bot.action('confirm_success', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id;
@@ -69,10 +79,9 @@ bot.action('confirm_success', async (ctx) => {
 
   await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
   await ctx.reply(
-    `🎉 *Upgrade Berhasil!*\n\n` +
-      `✅ Email *${state.email}* sudah berhasil di-upgrade ke *${PLAN_LABELS[state.plan || 'plus']}*!\n\n` +
-      `Terima kasih sudah menggunakan layanan kami. Silahkan login ke ChatGPT dan nikmati fitur premium kamu! 🚀`,
-    { parse_mode: 'Markdown' },
+    `🎉 Upgrade Berhasil!\n\n` +
+      `✅ Email ${state.email} sudah berhasil di-upgrade ke ${PLAN_LABELS[state.plan || 'plus']}!\n\n` +
+      `Silahkan login ke ChatGPT dan nikmati fitur premium kamu! 🚀`,
   );
 
   await closeSession(userId);
@@ -85,133 +94,119 @@ bot.action('confirm_cancel', async (ctx) => {
 
   await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
   await ctx.reply(
-    `❌ *Upgrade Dibatalkan*\n\n` +
-      `Proses upgrade telah dibatalkan. Jika ada masalah atau ingin mencoba lagi, ketik /start.\n\n` +
+    `❌ Upgrade Dibatalkan\n\n` +
+      `Proses upgrade telah dibatalkan. Ketik /start untuk mencoba lagi.\n\n` +
       `Hubungi admin jika butuh bantuan lebih lanjut.`,
-    { parse_mode: 'Markdown' },
   );
 
   await closeSession(userId);
   clearUserState(userId);
 });
 
-// Handle all text messages
+// ─── Text handler ─────────────────────────────────────────────────────────────
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const text = ctx.message.text.trim();
   const state = getUserState(userId);
 
-  // Ignore commands
   if (text.startsWith('/')) return;
 
+  // ── Waiting for email ──────────────────────────────────────────────────────
   if (state.step === 'waiting_email') {
     if (!isValidEmail(text)) {
       await ctx.reply(
-        `❌ Format email tidak valid. Pastikan email kamu benar.\n\nContoh: *user@gmail.com*`,
-        { parse_mode: 'Markdown' },
+        `❌ Format email tidak valid. Pastikan email kamu benar.\n\nContoh: user@gmail.com`,
       );
       return;
     }
 
     setUserState(userId, { step: 'processing', email: text });
 
-    const processingMsg = await ctx.reply(
-      `⏳ *Memproses...*\n\n` +
-        `📧 Email: \`${text}\`\n` +
+    await ctx.reply(
+      `⏳ Memproses...\n\n` +
+        `📧 Email: ${text}\n` +
         `📦 Paket: ${PLAN_LABELS[state.plan || 'plus']}\n\n` +
-        `🌐 Membuka browser dan menghubungi ChatGPT...\n` +
-        `Mohon tunggu sebentar.`,
-      { parse_mode: 'Markdown' },
+        `Kamu akan melihat update langkah-demi-langkah di bawah ini 👇`,
     );
 
-    try {
-      await startLoginFlow(userId, text);
+    const sendStatus = makeSendStatus(ctx);
 
-      setUserState(userId, { step: 'waiting_otp', messageId: processingMsg.message_id });
+    try {
+      await startLoginFlow(userId, text, sendStatus);
+      setUserState(userId, { step: 'waiting_otp' });
 
       await ctx.reply(
-        `📨 *OTP Dikirim!*\n\n` +
-          `Kode OTP telah dikirim ke email *${text}*.\n\n` +
-          `Silahkan cek inbox (atau spam) kamu dan kirimkan kode OTP di sini:`,
-        { parse_mode: 'Markdown' },
+        `📨 OTP Dikirim!\n\n` +
+          `Kode OTP telah dikirim ke email ${text}\n\n` +
+          `Silahkan cek inbox (atau folder spam) kamu, lalu kirimkan kode OTP di sini:`,
       );
     } catch (err) {
       logger.error({ err, userId }, 'Error in startLoginFlow');
-      setUserState(userId, { step: 'waiting_email' });
-      const shortErr = String((err as Error).message).slice(0, 200);
+      await closeSession(userId);
+      clearUserState(userId);
+      const shortErr = String((err as Error).message).slice(0, 300);
       await ctx.reply(
-        `❌ Terjadi kesalahan saat menghubungi ChatGPT.\n\n` +
-          `Error: ${shortErr}\n\n` +
-          `Silahkan coba lagi dengan mengirim email kamu.`,
+        `❌ Terjadi kesalahan saat menghubungi ChatGPT.\n\nError: ${shortErr}\n\nKetik /start untuk mencoba lagi.`,
       );
     }
     return;
   }
 
+  // ── Waiting for OTP ────────────────────────────────────────────────────────
   if (state.step === 'waiting_otp') {
     const otp = text.replace(/\s/g, '');
     if (!/^\d{4,8}$/.test(otp)) {
       await ctx.reply(
-        `❌ Format OTP tidak valid. OTP biasanya terdiri dari 4-8 digit angka.\n\nContoh: *123456*`,
-        { parse_mode: 'Markdown' },
+        `❌ Format OTP tidak valid. OTP biasanya terdiri dari 4-8 digit angka.\n\nContoh: 123456`,
       );
       return;
     }
 
     setUserState(userId, { step: 'processing' });
 
-    const processingMsg = await ctx.reply(
-      `⏳ *Memverifikasi OTP...*\n\n` +
-        `🔐 Memasukkan kode OTP...\n` +
-        `🌐 Proses login berlangsung...\n\n` +
-        `Mohon tunggu, ini bisa memakan waktu 1-2 menit.`,
-      { parse_mode: 'Markdown' },
+    await ctx.reply(
+      `✅ OTP diterima: ${otp}\n\n` +
+        `Kamu akan melihat update prosesnya di bawah ini 👇`,
     );
+
+    const sendStatus = makeSendStatus(ctx);
 
     try {
       const paymentLink = await submitOTP(userId, otp, state.plan || 'plus');
-
       setUserState(userId, { step: 'waiting_confirmation', paymentLink });
 
       await ctx.reply(
-        `✅ *Login Berhasil!*\n\n` +
-          `Proses upgrade sedang berlangsung.\n\n` +
+        `✅ Proses selesai!\n\n` +
           `💳 Silahkan selesaikan pembayaran pada link berikut:\n` +
           `${paymentLink}\n\n` +
-          `Setelah kamu selesai melakukan pembayaran, klik tombol *Sukses* di bawah:`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [
-              Markup.button.callback('✅ Sukses', 'confirm_success'),
-              Markup.button.callback('❌ Batal', 'confirm_cancel'),
-            ],
-          ]),
-        },
+          `Setelah kamu selesai melakukan pembayaran, klik tombol Sukses di bawah:`,
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback('✅ Sukses', 'confirm_success'),
+            Markup.button.callback('❌ Batal', 'confirm_cancel'),
+          ],
+        ]),
       );
     } catch (err) {
       logger.error({ err, userId }, 'Error in submitOTP');
       clearUserState(userId);
       await closeSession(userId);
-      const shortErr = String((err as Error).message).slice(0, 200);
+      const shortErr = String((err as Error).message).slice(0, 300);
       await ctx.reply(
-        `❌ Terjadi kesalahan saat memproses OTP.\n\n` +
-          `Error: ${shortErr}\n\n` +
-          `Silahkan mulai ulang dengan /start`,
+        `❌ Terjadi kesalahan saat memproses.\n\nError: ${shortErr}\n\nKetik /start untuk mencoba lagi.`,
       );
     }
     return;
   }
 
+  // ── Processing ─────────────────────────────────────────────────────────────
   if (state.step === 'processing') {
     await ctx.reply(`⏳ Sedang memproses, harap tunggu...`);
     return;
   }
 
-  // Default
-  await ctx.reply(
-    `Ketik /start untuk memulai proses upgrade ChatGPT kamu.`,
-  );
+  // ── Default ────────────────────────────────────────────────────────────────
+  await ctx.reply(`Ketik /start untuk memulai proses upgrade ChatGPT kamu.`);
 });
 
 export default bot;
