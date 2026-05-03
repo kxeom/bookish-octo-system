@@ -879,69 +879,96 @@ async function processCheckout(
     return checkoutUrl;
   }
 
-  // ── Find the Stripe iframe that contains GoPay fields ────────────────────
-  // After selecting GoPay, Stripe shows name + phone fields inside the iframe
-  let stripeFrame = page.mainFrame();
-  for (const frame of page.frames()) {
-    if (frame.url().includes('stripe.com')) {
-      stripeFrame = frame;
-      break;
+  // ── Find all Stripe iframes and log their inputs ─────────────────────────
+  await sleep(rand(2000, 3000)); // let Stripe render name/phone after GoPay tap
+
+  const allFrames = page.frames();
+  logger.info({ userId, frameCount: allFrames.length }, 'All frames after GoPay selection');
+  for (const frame of allFrames) {
+    if (frame === page.mainFrame()) continue;
+    const frameUrl = frame.url();
+    const inputs = await frame.$$eval('input', (els) =>
+      els.map((el) => ({
+        name: (el as HTMLInputElement).name,
+        type: (el as HTMLInputElement).type,
+        placeholder: (el as HTMLInputElement).placeholder,
+        autocomplete: (el as HTMLInputElement).autocomplete,
+        visible: (el as HTMLElement).offsetParent !== null,
+      })),
+    ).catch(() => [] as object[]);
+    logger.info({ userId, frameUrl: frameUrl.slice(0, 80), inputs }, 'Frame inputs');
+  }
+
+  // Helper: fill an input element human-like (works inside any frame)
+  async function fillInput(el: import('playwright').ElementHandle, value: string): Promise<void> {
+    await el.click();
+    await sleep(rand(150, 300));
+    await el.fill('');
+    await sleep(100);
+    for (const ch of value) {
+      await el.pressSequentially(ch, { delay: rand(60, 150) });
     }
   }
 
-  // ── Fill name in Stripe iframe ────────────────────────────────────────────
-  const nameFieldSelectors = [
+  // ── Fill name + phone in ANY Stripe iframe that has those fields ──────────
+  const nameSelectors = [
     'input[placeholder*="Full name" i]',
+    'input[placeholder*="Name on card" i]',
     'input[placeholder*="Name" i]',
     'input[name="billingName"]',
     'input[name="name"]',
     'input[autocomplete="name"]',
     'input[autocomplete="given-name"]',
   ];
-  for (const sel of nameFieldSelectors) {
-    const el = await stripeFrame.$(sel).catch(() => null);
-    if (el && await el.isVisible().catch(() => false)) {
-      const randomName = generateRandomName();
-      await el.click();
-      await sleep(rand(200, 400));
-      await el.fill('');
-      for (const ch of randomName) {
-        await stripeFrame.type(sel, ch);
-        await sleep(rand(60, 140));
-      }
-      await sendStatus(`📝 Nama billing: ${randomName}`);
-      logger.info({ userId, randomName }, 'Name filled in Stripe iframe');
-      break;
-    }
-  }
-
-  await sleep(rand(300, 600));
-
-  // ── Fill phone in Stripe iframe ───────────────────────────────────────────
-  // GoPay requires Indonesian phone number — use a realistic one
-  const phoneSelectors = [
-    'input[placeholder*="phone" i]',
-    'input[placeholder*="telepon" i]',
+  const phoneInputSelectors = [
+    'input[placeholder*="GoPay phone" i]',
+    'input[placeholder*="phone number" i]',
     'input[placeholder*="Phone" i]',
+    'input[placeholder*="Nomor" i]',
     'input[name="phone"]',
     'input[type="tel"]',
     'input[autocomplete="tel"]',
   ];
-  const fakePhone = `08${rand(1000000000, 9999999999)}`.slice(0, 12);
-  for (const sel of phoneSelectors) {
-    const el = await stripeFrame.$(sel).catch(() => null);
-    if (el && await el.isVisible().catch(() => false)) {
-      await el.click();
-      await sleep(rand(200, 400));
-      await el.fill('');
-      for (const ch of fakePhone) {
-        await stripeFrame.type(sel, ch);
-        await sleep(rand(60, 130));
+  const fakePhone = `0812${rand(10000000, 99999999)}`;
+
+  // Search every frame (including main) for name/phone inputs
+  const searchFrames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+
+  let nameFilled = false;
+  let phoneFilled = false;
+
+  for (const frame of searchFrames) {
+    if (!nameFilled) {
+      for (const sel of nameSelectors) {
+        const el = await frame.$(sel).catch(() => null);
+        if (el && await el.isVisible().catch(() => false)) {
+          const randomName = generateRandomName();
+          await fillInput(el, randomName);
+          await sendStatus(`📝 Nama billing: ${randomName}`);
+          logger.info({ userId, sel, randomName, frameUrl: frame.url().slice(0, 60) }, 'Name filled');
+          nameFilled = true;
+          break;
+        }
       }
-      await sendStatus(`📱 No. HP: ${fakePhone}`);
-      logger.info({ userId, phone: fakePhone }, 'Phone filled in Stripe iframe');
-      break;
     }
+    if (!phoneFilled) {
+      for (const sel of phoneInputSelectors) {
+        const el = await frame.$(sel).catch(() => null);
+        if (el && await el.isVisible().catch(() => false)) {
+          await fillInput(el, fakePhone);
+          await sendStatus(`📱 No. HP: ${fakePhone}`);
+          logger.info({ userId, sel, fakePhone, frameUrl: frame.url().slice(0, 60) }, 'Phone filled');
+          phoneFilled = true;
+          break;
+        }
+      }
+    }
+    if (nameFilled && phoneFilled) break;
+  }
+
+  if (!phoneFilled) {
+    logger.warn({ userId }, 'Phone field not found in any frame');
+    await sendStatus('⚠️ Field telepon tidak ditemukan, melanjutkan...');
   }
 
   await sleep(rand(800, 1500));
