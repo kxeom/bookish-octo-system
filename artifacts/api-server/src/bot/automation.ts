@@ -13,8 +13,32 @@ interface BrowserSession {
 
 const sessions = new Map<number, BrowserSession>();
 
-const SYSTEM_CHROMIUM =
-  '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium';
+// Auto-detect Chromium: env override → common Linux paths → Nix fallback
+function findChromium(): string {
+  const candidates = [
+    process.env['CHROMIUM_PATH'],
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/local/bin/chromium',
+    '/snap/bin/chromium',
+    '/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium',
+  ];
+  const { execSync } = require('child_process') as typeof import('child_process');
+  for (const p of candidates) {
+    if (!p) continue;
+    try {
+      execSync(`test -f "${p}"`, { stdio: 'ignore' });
+      return p;
+    } catch {}
+  }
+  // Last resort: ask the system
+  try {
+    return execSync('which chromium-browser || which chromium', { encoding: 'utf8' }).trim();
+  } catch {}
+  throw new Error('Chromium tidak ditemukan. Set env CHROMIUM_PATH=/path/to/chromium');
+}
+
+const SYSTEM_CHROMIUM = findChromium();
 
 // ─── Stealth init script (injected before every page load) ───────────────────
 // Hides all Playwright/CDP automation indicators from the page's JavaScript
