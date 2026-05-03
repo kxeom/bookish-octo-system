@@ -920,13 +920,16 @@ async function processCheckout(
         await el.selectOption({ label: 'Indonesia' }).catch(() => el.selectOption({ value: 'ID' }));
         await sendStatus('🌏 Negara: Indonesia');
         logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'Country set to Indonesia');
-        await sleep(rand(300, 600));
+        // Wait longer for Stripe to re-render address fields after country change
+        await sleep(rand(1500, 2000));
         break;
       }
     }
 
     // ── Address line 1 ───────────────────────────────────────────────────────
+    // Stripe internal field name is "addressLine1" (camelCase), not "line1"
     for (const sel of [
+      'input[name="addressLine1"]',
       'input[autocomplete="address-line1"]',
       'input[name="line1"]',
       'input[name="address"]',
@@ -943,8 +946,9 @@ async function processCheckout(
       }
     }
 
-    // ── City ─────────────────────────────────────────────────────────────────
+    // ── City (Stripe uses "locality") ─────────────────────────────────────────
     for (const sel of [
+      'input[name="locality"]',
       'input[autocomplete="address-level2"]',
       'input[name="city"]',
       'input[placeholder*="City" i]',
@@ -954,38 +958,43 @@ async function processCheckout(
       if (el && await el.isVisible().catch(() => false)) {
         await el.click(); await sleep(rand(100, 200));
         await el.fill('Jakarta Pusat');
+        await sendStatus('🏙️ Kota: Jakarta Pusat');
         logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'City filled');
         break;
       }
     }
 
-    // ── State / Province ─────────────────────────────────────────────────────
+    // ── State / Province (Stripe uses "administrativeArea") ──────────────────
     for (const sel of [
-      'input[autocomplete="address-level1"]',
+      'select[name="administrativeArea"]',
+      'input[name="administrativeArea"]',
       'select[autocomplete="address-level1"]',
-      'input[name="state"]',
+      'input[autocomplete="address-level1"]',
       'select[name="state"]',
-      'input[placeholder*="State" i]',
-      'input[placeholder*="Province" i]',
+      'input[name="state"]',
     ]) {
       const el = await frame.$(sel).catch(() => null);
       if (el && await el.isVisible().catch(() => false)) {
         const tag = await el.evaluate((n) => n.tagName.toLowerCase());
         if (tag === 'select') {
+          // Try common Indonesian province labels
           await (el as import('playwright').ElementHandle<HTMLSelectElement>)
             .selectOption({ label: 'DKI Jakarta' })
+            .catch(() => (el as import('playwright').ElementHandle<HTMLSelectElement>).selectOption({ label: 'Jakarta' }))
             .catch(() => (el as import('playwright').ElementHandle<HTMLSelectElement>).selectOption({ index: 1 }));
         } else {
           await el.click(); await sleep(rand(100, 200));
           await el.fill('DKI Jakarta');
         }
-        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'State filled');
+        await sendStatus('🗺️ Provinsi: DKI Jakarta');
+        logger.info({ userId, sel, furl: furl.slice(0, 60) }, 'State/province filled');
         break;
       }
     }
 
-    // ── Postal code ──────────────────────────────────────────────────────────
+    // ── Postal code (Stripe uses "postalCode") ───────────────────────────────
     for (const sel of [
+      'input[name="postalCode"]',
       'input[autocomplete="postal-code"]',
       'input[name="postal_code"]',
       'input[name="zip"]',
