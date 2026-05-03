@@ -30,23 +30,20 @@ function makeSendStatus(ctx: Context): StatusCallback {
 bot.start(async (ctx) => {
   clearUserState(ctx.from.id);
   await ctx.reply(
-    `👋 *Selamat datang di ChatGPT Upgrade Bot!*\n\n` +
+    `👋 Selamat datang di ChatGPT Upgrade Bot!\n\n` +
       `Bot ini akan membantu kamu upgrade akun ChatGPT secara otomatis.\n\n` +
-      `📋 *Cara Pemakaian:*\n` +
+      `📋 Cara Pemakaian:\n` +
       `1. Pilih paket yang kamu inginkan\n` +
       `2. Masukkan email kamu\n` +
       `3. Masukkan OTP yang dikirim ke email\n` +
-      `4. Bot memproses upgrade otomatis (kamu bisa lihat prosesnya real\\-time)\n` +
+      `4. Bot memproses upgrade otomatis (kamu bisa lihat prosesnya real-time)\n` +
       `5. Konfirmasi setelah pembayaran selesai\n\n` +
-      `⚠️ *Pastikan email kamu aktif dan dapat menerima OTP*\n\n` +
+      `⚠️ Pastikan email kamu aktif dan dapat menerima OTP\n\n` +
       `Pilih paket upgrade:`,
-    {
-      parse_mode: 'MarkdownV2',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('⭐ Upgrade Plus', 'plan_plus')],
-        [Markup.button.callback('💼 Upgrade Business', 'plan_business')],
-      ]),
-    },
+    Markup.inlineKeyboard([
+      [Markup.button.callback('⭐ Upgrade Plus', 'plan_plus')],
+      [Markup.button.callback('💼 Upgrade Business', 'plan_business')],
+    ]),
   );
 });
 

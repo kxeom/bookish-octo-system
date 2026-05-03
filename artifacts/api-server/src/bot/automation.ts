@@ -110,9 +110,10 @@ export async function startLoginFlow(
   }
 
   await sendStatus('✅ Tombol Login ditekan, menunggu form muncul...');
+  // Wait for modal to appear
   await page.waitForTimeout(3000);
 
-  // ── Step 3: Detect form — inline popup or redirect to auth page ──────────
+  // ── Step 3: Detect form — inline modal or redirect to auth page ──────────
   const currentUrl = page.url();
   logger.info({ userId, url: currentUrl }, 'URL after login click');
 
@@ -123,24 +124,34 @@ export async function startLoginFlow(
     return;
   }
 
-  // Form appeared inline on chatgpt.com — look for email option
-  await sendStatus('📋 Form login muncul, memilih opsi Email...');
+  // ── Modal inline on chatgpt.com ──────────────────────────────────────────
+  // From UI: modal shows "Log in or sign up" with Google/Apple/Phone buttons
+  // then an "Email address" input field and "Continue" button
+  await sendStatus('📋 Form login muncul...');
 
-  // Sometimes there's a "Continue with email" or just an email input directly
-  const emailOptionClicked = await clickFirst(page, [
-    'button:has-text("Continue with email")',
-    'a:has-text("Continue with email")',
-    'button:has-text("Email")',
-    '[data-provider="email"]',
-    'button:has-text("Use email")',
-  ], 5000);
-
-  if (emailOptionClicked) {
-    await sendStatus('✅ Opsi email dipilih');
-    await page.waitForTimeout(2000);
+  // Wait for the email input in the modal (placeholder: "Email address")
+  try {
+    await page.waitForSelector(
+      'input[placeholder="Email address"], input[placeholder*="email" i], input[placeholder*="Email" i]',
+      { timeout: 8000, state: 'visible' },
+    );
+    await sendStatus('✅ Form email terdeteksi');
+  } catch {
+    // Maybe there's a "Continue with email" button first
+    await sendStatus('🔍 Mencari opsi login dengan email...');
+    const emailOptionClicked = await clickFirst(page, [
+      'button:has-text("Continue with email")',
+      'a:has-text("Continue with email")',
+      'button:has-text("Email")',
+      '[data-provider="email"]',
+    ], 6000);
+    if (emailOptionClicked) {
+      await sendStatus('✅ Opsi email dipilih');
+      await page.waitForTimeout(2000);
+    }
   }
 
-  // Now fill the email input
+  // Fill email in the modal
   await fillEmailOnPage(userId, page, email, sendStatus);
 }
 
@@ -154,7 +165,10 @@ async function fillEmailOnPage(
   await sendStatus(`📧 Mengisi email: ${email}`);
 
   const emailSelectors = [
-    'input[name="username"]',   // Auth0 standard
+    'input[placeholder="Email address"]',   // ChatGPT inline modal (from screenshot)
+    'input[placeholder*="Email" i]',
+    'input[placeholder*="email" i]',
+    'input[name="username"]',               // Auth0 standard
     'input[name="email"]',
     'input[type="email"]',
     'input[autocomplete="email"]',
