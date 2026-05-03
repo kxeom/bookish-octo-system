@@ -468,32 +468,74 @@ export async function submitOTP(
 
   await sleep(rand(400, 800));
 
-  // Submit (may auto-submit on last digit)
-  await waitAndClick(page, [
+  // Submit — try button first, but OTP might auto-submit on 6th digit
+  const submitted = await waitAndClick(page, [
     'button[type="submit"]',
     'button:has-text("Continue")',
     'button:has-text("Verify")',
     'button:has-text("Confirm")',
-  ], 5000).catch(() => { /* may auto-submit */ });
+    'button:has-text("Submit")',
+  ], 5000).catch(() => false);
 
-  await sendStatus('🔄 OTP dikirim, menunggu redirect...');
-
-  try {
-    await page.waitForURL(/chatgpt\.com/, { timeout: 30000 });
-  } catch {
-    logger.warn({ userId, url: page.url() }, 'Timeout waiting for chatgpt.com after OTP');
+  if (!submitted) {
+    logger.info({ userId }, 'No submit button found — assuming OTP auto-submitted');
+    // Press Enter as fallback
+    await page.keyboard.press('Enter');
   }
 
-  await sleep(rand(2000, 4000));
-  await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
+  await sendStatus('🔄 OTP dikirim, menunggu redirect...');
+  logger.info({ userId }, 'Waiting for redirect after OTP');
 
-  // Handle new account setup (name/birthday)
+  // Wait up to 45s — new accounts may take longer to redirect
+  try {
+    await page.waitForURL(
+      (url) => url.hostname.includes('chatgpt.com'),
+      { timeout: 45000 },
+    );
+  } catch {
+    const currentUrl = page.url();
+    logger.warn({ userId, url: currentUrl }, 'Timeout waiting for chatgpt.com after OTP');
+    // If still on auth.openai.com, there might be an error or extra step
+    if (currentUrl.includes('auth.openai.com')) {
+      // Check for error message on page
+      const pageText = await page.$eval('body', (b) => (b as HTMLElement).innerText).catch(() => '');
+      if (pageText.includes('expired') || pageText.includes('invalid') || pageText.includes('incorrect')) {
+        throw new Error('Kode OTP salah atau sudah kadaluarsa. Mulai ulang dengan /start');
+      }
+      // Try pressing Enter once more
+      await page.keyboard.press('Enter');
+      await sleep(3000);
+      // One more wait
+      try {
+        await page.waitForURL((url) => url.hostname.includes('chatgpt.com'), { timeout: 15000 });
+      } catch {
+        throw new Error('Redirect ke chatgpt.com tidak terjadi setelah OTP. Coba /start lagi.');
+      }
+    }
+  }
+
+  await sleep(rand(2000, 3000));
+  const landedUrl = page.url();
+  logger.info({ userId, url: landedUrl }, 'Landed after OTP');
+  await sendStatus(`✅ Berada di: ${shortUrl(landedUrl)}`);
+
+  // ── Handle new account onboarding (/about-you, /onboarding, etc.) ─────────
   await handleNewAccountFlow(userId, page, sendStatus);
 
-  // Go to chatgpt.com if not already there
-  if (!page.url().startsWith('https://chatgpt.com')) {
-    await sendStatus('🌐 Kembali ke chatgpt.com...');
-    await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+  // After onboarding, make sure we end up on chatgpt.com home
+  const finalLanded = page.url();
+  if (!finalLanded.startsWith('https://chatgpt.com') ||
+      finalLanded.includes('/about-you') ||
+      finalLanded.includes('/onboarding')) {
+    await sendStatus('🌐 Menunggu chatgpt.com siap...');
+    try {
+      await page.waitForURL(
+        (url) => url.hostname === 'chatgpt.com' && !url.pathname.includes('/about-you') && !url.pathname.includes('/onboarding'),
+        { timeout: 15000 },
+      );
+    } catch {
+      await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    }
     await sleep(2000);
   }
 
@@ -511,50 +553,119 @@ export async function submitOTP(
   return paymentLink;
 }
 
-// ─── Handle new account (name / birthday / age) ───────────────────────────────
+// ─── Handle new account onboarding (loops through all screens) ───────────────
+// Handles /about-you, /onboarding, name/birthday/age inputs
 async function handleNewAccountFlow(
   userId: number,
   page: Page,
   sendStatus: StatusCallback,
 ): Promise<void> {
-  const nameInput = await page.$('input[name="name"], input[id="name"]');
-  if (nameInput && await nameInput.isVisible().catch(() => false)) {
-    const randomName = generateRandomName();
-    await humanType(page, 'input[name="name"], input[id="name"]', randomName);
-    await sendStatus(`📝 Akun baru: mengisi nama "${randomName}"`);
-    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], 8000).catch(() => {});
-    await sleep(2000);
-  }
+  // Loop through onboarding steps — each iteration handles one screen
+  for (let step = 0; step < 8; step++) {
+    const url = page.url();
 
-  const ageInput = await page.$('input[type="number"], input[name="age"]');
-  if (ageInput && await ageInput.isVisible().catch(() => false)) {
-    const age = generateRandomAge();
-    await humanType(page, 'input[type="number"], input[name="age"]', age);
-    await sendStatus(`📅 Mengisi umur: ${age}`);
-    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
-    await sleep(2000);
-  }
+    // Stop if we've reached chatgpt.com main chat (not an onboarding page)
+    const isOnboarding =
+      url.includes('/about-you') ||
+      url.includes('/onboarding') ||
+      url.includes('/setup') ||
+      url.includes('/welcome') ||
+      url.includes('/get-started');
 
-  const dateInput = await page.$('input[type="date"], input[name="birthdate"]');
-  if (dateInput && await dateInput.isVisible().catch(() => false)) {
-    const { month, day, year } = generateRandomBirthdate();
-    await dateInput.fill(`${year}-${month}-${day}`);
-    await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
-    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
-    await sleep(2000);
-  }
+    const isHome =
+      url === 'https://chatgpt.com/' ||
+      url === 'https://chatgpt.com' ||
+      url.includes('/c/') ||
+      url.includes('/?') ;
 
-  const monthSel = await page.$('select[name="month"]');
-  const daySel   = await page.$('select[name="day"]');
-  const yearSel  = await page.$('select[name="year"]');
-  if (monthSel && daySel && yearSel) {
-    const { month, day, year } = generateRandomBirthdate();
-    await monthSel.selectOption({ value: month });
-    await daySel.selectOption({ value: day });
-    await yearSel.selectOption({ value: year });
-    await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
-    await waitAndClick(page, ['button[type="submit"]', 'button:has-text("Continue")'], 8000).catch(() => {});
-    await sleep(2000);
+    if (isHome && !isOnboarding) {
+      logger.info({ userId, url }, 'Onboarding complete — on chatgpt.com home');
+      break;
+    }
+
+    logger.info({ userId, url, step }, 'Handling onboarding step');
+
+    // ── Name input ──────────────────────────────────────────────────────────
+    const nameSelectors = [
+      'input[name="name"]',
+      'input[id="name"]',
+      'input[placeholder*="name" i]',
+      'input[placeholder*="nama" i]',
+      'input[autocomplete="name"]',
+      'input[autocomplete="given-name"]',
+    ];
+    for (const sel of nameSelectors) {
+      const el = await page.$(sel).catch(() => null);
+      if (el && await el.isVisible().catch(() => false)) {
+        const randomName = generateRandomName();
+        await humanType(page, sel, randomName);
+        await sendStatus(`📝 Mengisi nama: ${randomName}`);
+        logger.info({ userId, sel, randomName }, 'Name filled');
+        break;
+      }
+    }
+
+    // ── Birthday — date input ───────────────────────────────────────────────
+    const dateInput = await page.$('input[type="date"], input[name="birthdate"], input[name="birthday"]').catch(() => null);
+    if (dateInput && await dateInput.isVisible().catch(() => false)) {
+      const { month, day, year } = generateRandomBirthdate();
+      await dateInput.fill(`${year}-${month}-${day}`);
+      await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
+      logger.info({ userId }, 'Birthdate filled via date input');
+    }
+
+    // ── Birthday — separate selects ─────────────────────────────────────────
+    const monthSel = await page.$('select[name="month"], select[id="month"]').catch(() => null);
+    const daySel   = await page.$('select[name="day"],   select[id="day"]').catch(() => null);
+    const yearSel  = await page.$('select[name="year"],  select[id="year"]').catch(() => null);
+    if (monthSel && daySel && yearSel) {
+      const { month, day, year } = generateRandomBirthdate();
+      await monthSel.selectOption({ value: month });
+      await sleep(300);
+      await daySel.selectOption({ value: day });
+      await sleep(300);
+      await yearSel.selectOption({ value: year });
+      await sendStatus(`📅 Mengisi tanggal lahir: ${day}/${month}/${year}`);
+      logger.info({ userId }, 'Birthdate filled via selects');
+    }
+
+    // ── Age input ───────────────────────────────────────────────────────────
+    const ageInput = await page.$('input[name="age"], input[id="age"], input[type="number"]').catch(() => null);
+    if (ageInput && await ageInput.isVisible().catch(() => false)) {
+      const age = generateRandomAge();
+      await humanType(page, 'input[name="age"], input[id="age"], input[type="number"]', age);
+      await sendStatus(`📅 Mengisi umur: ${age}`);
+      logger.info({ userId, age }, 'Age filled');
+    }
+
+    // ── Click Continue/Next/Done to proceed to next screen ─────────────────
+    await sleep(rand(500, 1000));
+    const continued = await waitAndClick(page, [
+      'button[type="submit"]',
+      'button:has-text("Continue")',
+      'button:has-text("Next")',
+      'button:has-text("Done")',
+      'button:has-text("Get started")',
+      'button:has-text("Agree")',
+      'button:has-text("Accept")',
+      'button:has-text("I agree")',
+      'button:has-text("OK")',
+    ], 6000);
+
+    if (continued) {
+      logger.info({ userId, step }, 'Clicked continue on onboarding step');
+      await sleep(rand(2000, 3500));
+    } else {
+      // No button found — might already be done or waiting
+      logger.info({ userId, step }, 'No continue button found on step');
+      await sleep(2000);
+      // Check if URL changed
+      if (page.url() === url) {
+        // Same URL, nothing happened — stop looping
+        logger.info({ userId }, 'URL unchanged, stopping onboarding loop');
+        break;
+      }
+    }
   }
 }
 
