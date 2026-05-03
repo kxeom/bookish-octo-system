@@ -807,36 +807,85 @@ async function processCheckout(
   checkoutUrl: string,
   sendStatus: StatusCallback,
 ): Promise<string> {
+  logger.info({ userId, checkoutUrl }, 'processCheckout: navigating to checkout URL');
   await sendStatus(`🔀 Menuju checkout: ${shortUrl(checkoutUrl)}`);
-  await page.goto(checkoutUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(rand(3000, 5000));
-  await sendStatus(`✅ Berada di: ${shortUrl(page.url())}`);
 
-  // Select GoPay
+  await page.goto(checkoutUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Wait longer for Stripe.js to fully render (it's slow)
+  await sleep(rand(5000, 7000));
+
+  const pageAfterNav = page.url();
+  logger.info({ userId, url: pageAfterNav }, 'processCheckout: landed on page');
+  await sendStatus(`✅ Berada di: ${shortUrl(pageAfterNav)}`);
+
+  // Dump visible text to help debug what's on the page
+  const pageText = await page.$eval('body', (b) => (b as HTMLElement).innerText)
+    .catch(() => '');
+  logger.info({ userId, preview: pageText.slice(0, 300) }, 'processCheckout: page text preview');
+
+  // ── Try to select GoPay ──────────────────────────────────────────────────
   await sendStatus('💳 Memilih metode pembayaran GoPay...');
-  const gopayClicked = await waitAndClick(page, [
-    'text=GoPay',
+
+  // Stripe checkout for Indonesia may render GoPay inside an iframe — check both
+  const gopaySelectors = [
+    'input[value*="gopay" i]',
+    'input[value*="go_pay" i]',
+    '[data-type*="gopay" i]',
+    '[data-payment-method*="gopay" i]',
     'label:has-text("GoPay")',
-    '[data-value*="gopay"]',
     'button:has-text("GoPay")',
-    '[aria-label*="GoPay"]',
-  ], 8000);
+    '[aria-label*="GoPay" i]',
+    'div:has-text("GoPay") input[type="radio"]',
+    'li:has-text("GoPay")',
+  ];
+
+  let gopayClicked = false;
+
+  // Try in main frame
+  for (const sel of gopaySelectors) {
+    const el = await page.$(sel).catch(() => null);
+    if (el && await el.isVisible().catch(() => false)) {
+      await humanClick(page, sel, 5000);
+      gopayClicked = true;
+      logger.info({ userId, sel }, 'GoPay selected in main frame');
+      break;
+    }
+  }
+
+  // Try inside iframes if not found in main frame
+  if (!gopayClicked) {
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      for (const sel of gopaySelectors) {
+        const el = await frame.$(sel).catch(() => null);
+        if (el && await el.isVisible().catch(() => false)) {
+          await el.click();
+          gopayClicked = true;
+          logger.info({ userId, sel, frameUrl: frame.url() }, 'GoPay selected in iframe');
+          break;
+        }
+      }
+      if (gopayClicked) break;
+    }
+  }
 
   if (gopayClicked) {
     await sendStatus('✅ GoPay dipilih');
+    await sleep(rand(1500, 2500));
   } else {
-    await sendStatus('⚠️ GoPay tidak ditemukan, melanjutkan...');
+    logger.warn({ userId }, 'GoPay not found on checkout page — returning raw checkout URL');
+    await sendStatus('⚠️ GoPay tidak ditemukan di halaman checkout');
+    // Return the original checkoutUrl so user can open it directly
+    return checkoutUrl;
   }
 
-  await sleep(rand(1500, 2500));
-
-  // Fill address if needed
+  // ── Fill address if required ─────────────────────────────────────────────
   for (const sel of [
     'input[placeholder*="address" i]',
     'input[name="address"]',
     'input[placeholder*="alamat" i]',
   ]) {
-    const el = await page.$(sel);
+    const el = await page.$(sel).catch(() => null);
     if (el && await el.isVisible().catch(() => false)) {
       await humanType(page, sel, 'Jl. Sudirman No. 123, Jakarta Pusat');
       await sendStatus('📍 Alamat diisi otomatis');
@@ -846,24 +895,41 @@ async function processCheckout(
 
   await sleep(rand(800, 1500));
 
-  // Click Subscribe
+  // ── Click Subscribe / Pay ────────────────────────────────────────────────
   await sendStatus('🖱️ Menekan tombol Subscribe...');
   const subscribeClicked = await waitAndClick(page, [
     'button:has-text("Subscribe")',
     'button:has-text("Berlangganan")',
+    'button:has-text("Pay")',
+    'button:has-text("Bayar")',
     'button[type="submit"]:has-text("Subscribe")',
     'button[type="submit"]',
   ], 10000);
 
   if (subscribeClicked) {
-    await sendStatus('✅ Tombol Subscribe ditekan, menunggu redirect...');
+    await sendStatus('✅ Tombol Subscribe ditekan, menunggu redirect ke GoPay...');
+    // Wait for redirect to GoPay or external payment page
+    try {
+      await page.waitForURL(
+        (url) => !url.hostname.includes('chatgpt.com'),
+        { timeout: 20000 },
+      );
+    } catch {
+      logger.warn({ userId, url: page.url() }, 'No external redirect after Subscribe');
+    }
   }
 
-  await sleep(rand(5000, 7000));
+  await sleep(rand(3000, 5000));
 
   const finalUrl = page.url();
-  await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
   logger.info({ userId, finalUrl }, 'Final URL after subscribe');
+  await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
+
+  // If still on chatgpt.com (no external redirect), return the checkout URL
+  if (finalUrl.includes('chatgpt.com')) {
+    logger.info({ userId }, 'Still on chatgpt.com — returning original checkoutUrl');
+    return checkoutUrl;
+  }
 
   return finalUrl;
 }
