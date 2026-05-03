@@ -538,18 +538,40 @@ export async function submitOTP(
     await sleep(2000);
   }
 
-  await sendStatus('✅ Login berhasil! Mengambil session token...');
-  const sessionToken = await extractSession(page);
-  await sendStatus('✅ Session token berhasil diambil');
+  // ── Retry loop: get fresh session + checkout URL until price is IDR 0 ──────
+  const MAX_CHECKOUT_ATTEMPTS = 3;
 
-  await sendStatus(`💳 Membuat link checkout untuk paket ${plan}...`);
-  const checkoutUrl = await callPaymentAPI(sessionToken, plan);
-  await sendStatus('✅ Link checkout berhasil dibuat');
+  for (let attempt = 1; attempt <= MAX_CHECKOUT_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      await sendStatus(`🔄 Retry checkout (${attempt}/${MAX_CHECKOUT_ATTEMPTS})...`);
+      // Go back to chatgpt.com home so session is fresh before re-extracting
+      await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await sleep(rand(2000, 3000));
+    }
 
-  await sendStatus('🛒 Membuka halaman checkout...');
-  const paymentLink = await processCheckout(userId, page, checkoutUrl, sendStatus);
+    await sendStatus('✅ Login berhasil! Mengambil session token...');
+    const sessionToken = await extractSession(page);
+    await sendStatus('✅ Session token berhasil diambil');
 
-  return paymentLink;
+    await sendStatus(`💳 Membuat link checkout untuk paket ${plan}... (percobaan ${attempt}/${MAX_CHECKOUT_ATTEMPTS})`);
+    const checkoutUrl = await callPaymentAPI(sessionToken, plan);
+    logger.info({ userId, attempt, checkoutUrl }, 'Checkout URL from API');
+    await sendStatus('✅ Link checkout berhasil dibuat');
+
+    await sendStatus('🛒 Membuka halaman checkout...');
+    const paymentLink = await processCheckout(userId, page, checkoutUrl, sendStatus);
+
+    if (paymentLink !== null) {
+      return paymentLink;
+    }
+
+    if (attempt < MAX_CHECKOUT_ATTEMPTS) {
+      logger.warn({ userId, attempt }, 'Checkout attempt failed (price not 0 or flow error), retrying...');
+      await sleep(rand(1500, 2500));
+    }
+  }
+
+  throw new Error(`Gagal mendapatkan harga IDR 0 setelah ${MAX_CHECKOUT_ATTEMPTS} percobaan. Coba email baru.`);
 }
 
 // ─── Handle auth.openai.com/about-you ────────────────────────────────────────
@@ -801,12 +823,13 @@ async function callPaymentAPI(session: string, plan: string): Promise<string> {
 }
 
 // ─── Process checkout ─────────────────────────────────────────────────────────
+// Returns payment URL on success, null if price is wrong or flow failed (caller should retry)
 async function processCheckout(
   userId: number,
   page: Page,
   checkoutUrl: string,
   sendStatus: StatusCallback,
-): Promise<string> {
+): Promise<string | null> {
   logger.info({ userId, checkoutUrl }, 'processCheckout: navigating to checkout URL');
   await sendStatus(`🔀 Menuju checkout: ${shortUrl(checkoutUrl)}`);
 
@@ -851,8 +874,8 @@ async function processCheckout(
         `Harga bukan 0! Kemungkinan offer/free trial tidak aktif. Proses dihentikan untuk keamanan.\n\n` +
         `Ketik /start untuk coba lagi dengan email baru.`,
       );
-      logger.warn({ userId, dueTodayRaw }, 'Non-zero price detected — aborting checkout');
-      return checkoutUrl;
+      logger.warn({ userId, dueTodayRaw }, 'Non-zero price detected — caller should retry');
+      return null;
     }
   } else {
     // Could not parse price — log and continue, don't block
@@ -911,9 +934,9 @@ async function processCheckout(
     // Give Stripe iframe time to show name/phone fields after GoPay selection
     await sleep(rand(2000, 3000));
   } else {
-    logger.warn({ userId }, 'GoPay not found on checkout page — returning raw checkout URL');
-    await sendStatus('⚠️ GoPay tidak ditemukan di halaman checkout');
-    return checkoutUrl;
+    logger.warn({ userId }, 'GoPay not found on checkout page — returning null for retry');
+    await sendStatus('⚠️ GoPay tidak ditemukan di halaman checkout, mencoba ulang...');
+    return null;
   }
 
   // Wait for Stripe to render address/name fields after GoPay selection
@@ -1121,8 +1144,8 @@ async function processCheckout(
       }
     }
 
-    await sendStatus('⚠️ Tidak ada redirect ke Midtrans setelah 60 detik. Cek logs untuk detail.');
-    return checkoutUrl;
+    await sendStatus('⚠️ Tidak ada redirect ke Midtrans setelah 60 detik, mencoba ulang...');
+    return null;
   }
 
   await sendStatus(`✅ Berada di: ${shortUrl(finalUrl)}`);
