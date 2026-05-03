@@ -28,15 +28,19 @@ PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
 if [ -z "$PNPM_BIN" ]; then
   warn "pnpm tidak ditemukan di PATH, mencoba install ulang..."
   npm install -g pnpm@latest
-  PNPM_BIN=$(command -v pnpm 2>/dev/null || echo "")
-  [ -z "$PNPM_BIN" ] && error "pnpm tetap tidak ditemukan. Coba logout & login SSH lagi, lalu jalankan ulang."
+  # Re-assign setelah install
+  hash -r 2>/dev/null || true
+  PNPM_BIN=$(command -v pnpm 2>/dev/null || ls /usr/local/bin/pnpm 2>/dev/null || ls /usr/bin/pnpm 2>/dev/null || echo "")
+  [ -z "$PNPM_BIN" ] && error "pnpm tetap tidak ditemukan. Jalankan: ln -sf \$(npm root -g)/../bin/pnpm /usr/bin/pnpm"
 fi
 
 if [ -z "$PM2_BIN" ]; then
   warn "pm2 tidak ditemukan di PATH, mencoba install ulang..."
   npm install -g pm2@latest
-  PM2_BIN=$(command -v pm2 2>/dev/null || echo "")
-  [ -z "$PM2_BIN" ] && error "pm2 tetap tidak ditemukan. Coba logout & login SSH lagi."
+  # Re-assign setelah install
+  hash -r 2>/dev/null || true
+  PM2_BIN=$(command -v pm2 2>/dev/null || ls /usr/local/bin/pm2 2>/dev/null || ls /usr/bin/pm2 2>/dev/null || echo "")
+  [ -z "$PM2_BIN" ] && error "pm2 tetap tidak ditemukan. Jalankan: ln -sf \$(npm root -g)/../bin/pm2 /usr/bin/pm2"
 fi
 
 log "pnpm ditemukan: $PNPM_BIN"
